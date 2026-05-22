@@ -35,6 +35,25 @@ class CardParsePage(QWidget):
     IN_REPO_COLOR = "#f9e2af"
     MISSING_COLOR = "#f38ba8"
 
+    # ── 亮色主题边框样式 ──
+    LIGHT_DROP_ZONE_STYLE = (
+        "QLabel#cardDropZone {"
+        "  background-color: #f5f5f5;"
+        "  border: 2px dashed #b0b0b0;"
+        "  border-radius: 8px;"
+        "  color: #888888;"
+        "  font-size: 14px;"
+        "}"
+    )
+    LIGHT_IMAGE_STYLE = (
+        "QLabel#cardImageLabel {"
+        "  background-color: #fafafa;"
+        "  border: 1px solid #c8c8c8;"
+        "  border-radius: 4px;"
+        "}"
+    )
+    LIGHT_CARD_TYPE_STYLE = "QLabel#cardTypeLabel { color: #888888; font-size: 12px; }"
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._result: CardParseResult | None = None
@@ -57,15 +76,7 @@ class CardParsePage(QWidget):
         self.drop_zone.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.drop_zone.setMinimumHeight(60)
         self.drop_zone.setMaximumHeight(80)
-        self.drop_zone.setStyleSheet(
-            "QLabel {"
-            "  background-color: #252540;"
-            "  border: 2px dashed #45475a;"
-            "  border-radius: 8px;"
-            "  color: #a6adc8;"
-            "  font-size: 14px;"
-            "}"
-        )
+        self.drop_zone.setObjectName("cardDropZone")
         self.drop_zone.setAcceptDrops(True)
         top_bar.addWidget(self.drop_zone, 1)
 
@@ -87,9 +98,7 @@ class CardParsePage(QWidget):
         self.image_label = QLabel()
         self.image_label.setFixedSize(220, 320)
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setStyleSheet(
-            "background-color: #313244; border: 1px solid #45475a; border-radius: 4px;"
-        )
+        self.image_label.setObjectName("cardImageLabel")
         self.image_label.setText("暂无卡片")
         left_panel.addWidget(self.image_label)
 
@@ -102,7 +111,7 @@ class CardParsePage(QWidget):
         # 卡片类型标签
         self.card_type_label = QLabel("")
         self.card_type_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.card_type_label.setStyleSheet("color: #a6adc8; font-size: 12px;")
+        self.card_type_label.setObjectName("cardTypeLabel")
         left_panel.addWidget(self.card_type_label)
 
         left_widget = QFrame()
@@ -155,6 +164,23 @@ class CardParsePage(QWidget):
         main_layout.addLayout(btn_layout)
 
     # ═══════════════════════════════════════════════════════
+    # 主题管理
+    # ═══════════════════════════════════════════════════════
+
+    def apply_theme(self, is_dark: bool):
+        """响应主题切换，设置对应样式"""
+        if is_dark:
+            # 清空内联样式，让 dark.qss（MainWindow 级别）接管
+            self.drop_zone.setStyleSheet("")
+            self.image_label.setStyleSheet("")
+            self.card_type_label.setStyleSheet("")
+        else:
+            # 亮色主题：设置可见边框
+            self.drop_zone.setStyleSheet(self.LIGHT_DROP_ZONE_STYLE)
+            self.image_label.setStyleSheet(self.LIGHT_IMAGE_STYLE)
+            self.card_type_label.setStyleSheet(self.LIGHT_CARD_TYPE_STYLE)
+
+    # ═══════════════════════════════════════════════════════
     # 拖放处理
     # ═══════════════════════════════════════════════════════
 
@@ -181,26 +207,36 @@ class CardParsePage(QWidget):
                     break
 
     def _highlight_drop_zone(self, active: bool):
+        """拖放高亮（根据当前主题使用对应颜色）"""
+        from app.config import get_config
+        is_dark = get_config().theme == "dark"
         if active:
-            self.drop_zone.setStyleSheet(
-                "QLabel {"
-                "  background-color: #2a3a4a;"
-                "  border: 2px dashed #89b4fa;"
-                "  border-radius: 8px;"
-                "  color: #89b4fa;"
-                "  font-size: 14px;"
-                "}"
-            )
+            if is_dark:
+                self.drop_zone.setStyleSheet(
+                    "QLabel#cardDropZone {"
+                    "  background-color: #2a3a4a;"
+                    "  border: 2px dashed #89b4fa;"
+                    "  border-radius: 8px;"
+                    "  color: #89b4fa;"
+                    "  font-size: 14px;"
+                    "}"
+                )
+            else:
+                self.drop_zone.setStyleSheet(
+                    "QLabel#cardDropZone {"
+                    "  background-color: #e3f2fd;"
+                    "  border: 2px dashed #1976d2;"
+                    "  border-radius: 8px;"
+                    "  color: #1976d2;"
+                    "  font-size: 14px;"
+                    "}"
+                )
         else:
-            self.drop_zone.setStyleSheet(
-                "QLabel {"
-                "  background-color: #252540;"
-                "  border: 2px dashed #45475a;"
-                "  border-radius: 8px;"
-                "  color: #a6adc8;"
-                "  font-size: 14px;"
-                "}"
-            )
+            # 恢复当前主题的默认样式
+            if is_dark:
+                self.drop_zone.setStyleSheet("")
+            else:
+                self.drop_zone.setStyleSheet(self.LIGHT_DROP_ZONE_STYLE)
 
     # ═══════════════════════════════════════════════════════
     # 卡片操作

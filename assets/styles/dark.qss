@@ -277,3 +277,21 @@ QToolTip {
     border: 1px solid #45475a;
     padding: 4px;
 }
+
+/* 卡片解析页 */
+QLabel#cardDropZone {
+    background-color: #252540;
+    border: 2px dashed #45475a;
+    border-radius: 8px;
+    color: #a6adc8;
+    font-size: 14px;
+}
+QLabel#cardImageLabel {
+    background-color: #313244;
+    border: 1px solid #45475a;
+    border-radius: 4px;
+}
+QLabel#cardTypeLabel {
+    color: #a6adc8;
+    font-size: 12px;
+}

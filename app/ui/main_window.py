@@ -3,7 +3,7 @@
 需求文档 v1.3 - 7.1 主窗口布局：
   - 顶部工具栏（安装/添加/设置按钮，搜索框）
   - 顶层 TabBar（Mod管理 / 解析卡片）
-  - Mod管理页：卡片拖放区 + 左侧 Mod 列表 + 右侧详情面板
+  - Mod管理页：左侧 Mod 列表 + 右侧详情面板
   - 解析卡片页：图片预览 + Mod 依赖列表（GUID|Mod名称|状态|操作）
   - 底部状态栏
 """
@@ -125,9 +125,6 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
 
-        # ── 卡片拖放区 ──
-        self._create_card_drop_zone(layout)
-
         # ── 主内容区（左右分栏）──
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
@@ -194,24 +191,6 @@ class MainWindow(QMainWindow):
         settings_btn.clicked.connect(self._open_settings)
         toolbar.addWidget(settings_btn)
 
-    def _create_card_drop_zone(self, parent_layout: QVBoxLayout):
-        """创建卡片拖放分析区"""
-        self.drop_zone = QLabel("🎴 拖入角色卡/服装卡 (PNG) 进行 Mod 依赖分析")
-        self.drop_zone.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.drop_zone.setMinimumHeight(60)
-        self.drop_zone.setMaximumHeight(80)
-        self.drop_zone.setStyleSheet(
-            "QLabel {"
-            "  background-color: #252540;"
-            "  border: 2px dashed #45475a;"
-            "  border-radius: 8px;"
-            "  color: #a6adc8;"
-            "  font-size: 14px;"
-            "}"
-        )
-        self.drop_zone.setAcceptDrops(True)
-        parent_layout.addWidget(self.drop_zone)
-
     def _create_left_panel(self) -> QWidget:
         """创建左侧面板（Tab 切换游戏/仓库的 Mod 列表）"""
         panel = QWidget()
@@ -277,47 +256,16 @@ class MainWindow(QMainWindow):
                 path = Path(url.toLocalFile())
                 if path.suffix.lower() == ".png":
                     event.acceptProposedAction()
-                    self._highlight_drop_zone(True)
                     return
         event.ignore()
 
-    def dragLeaveEvent(self, event):
-        self._highlight_drop_zone(False)
-
     def dropEvent(self, event: QDropEvent):
-        self._highlight_drop_zone(False)
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
                 path = Path(url.toLocalFile())
                 if path.suffix.lower() == ".png":
                     self._parse_card(path)
                     break
-
-    def _highlight_drop_zone(self, active: bool):
-        """高亮 Mod 管理页的拖放区"""
-        if active:
-            self.drop_zone.setStyleSheet(
-                "QLabel {"
-                "  background-color: #2a3a4a;"
-                "  border: 2px dashed #89b4fa;"
-                "  border-radius: 8px;"
-                "  color: #89b4fa;"
-                "  font-size: 14px;"
-                "}"
-            )
-        else:
-            self._reset_drop_zone_style()
-
-    def _reset_drop_zone_style(self):
-        self.drop_zone.setStyleSheet(
-            "QLabel {"
-            "  background-color: #252540;"
-            "  border: 2px dashed #45475a;"
-            "  border-radius: 8px;"
-            "  color: #a6adc8;"
-            "  font-size: 14px;"
-            "}"
-        )
 
     # ═══════════════════════════════════════════════════════
     # 卡片解析
@@ -750,6 +698,12 @@ class MainWindow(QMainWindow):
             qss_path = Path(__file__).parent.parent.parent / "assets" / "styles" / "dark.qss"
             if qss_path.exists():
                 self.setStyleSheet(qss_path.read_text(encoding="utf-8"))
+        else:
+            # 亮色主题：清除暗色 QSS，恢复系统默认样式
+            self.setStyleSheet("")
+
+        # 通知卡片解析页更新主题相关样式
+        self.card_page.apply_theme(theme == "dark")
 
     def _check_first_run(self):
         """首次运行引导"""

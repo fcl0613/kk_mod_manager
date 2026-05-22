@@ -286,6 +286,11 @@ class MainWindow(QMainWindow):
                 result.error_message,
             )
             self.status_bar.clearMessage()
+            # 重置卡片页拖放区（避免一直显示"解析中..."）
+            self.card_page.drop_zone.setText(
+                "🎴 拖入角色卡/服装卡 (PNG) 进行 Mod 依赖分析"
+            )
+            self.card_page.stats_label.setText("拖入 PNG 卡片开始解析")
             return
 
         # 检查 Mod 可用性
@@ -403,7 +408,7 @@ class MainWindow(QMainWindow):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "选择 zipmod 文件",
-            str(Path.home()),
+            "",
             "zipmod 文件 (*.zipmod);;所有文件 (*.*)",
         )
         if not file_path:
@@ -424,7 +429,7 @@ class MainWindow(QMainWindow):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "选择 zipmod 文件",
-            str(Path.home()),
+            "",
             "zipmod 文件 (*.zipmod);;所有文件 (*.*)",
         )
         if not file_path:

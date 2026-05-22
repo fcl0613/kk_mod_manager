@@ -249,7 +249,7 @@ class CardParsePage(QWidget):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "选择角色卡/服装卡",
-            str(Path.home()),
+            "",
             "PNG 文件 (*.png);;所有文件 (*.*)",
         )
         if file_path:

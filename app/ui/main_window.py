@@ -266,11 +266,8 @@ class MainWindow(QMainWindow):
             return
 
         # 检查 Mod 可用性
-        config = get_config()
         self._card_service.check_mod_availability(
             result,
-            config.game_mod_path,
-            config.repo_path,
             self._mod_service.session,
         )
 
@@ -293,11 +290,8 @@ class MainWindow(QMainWindow):
             return None
         result = self._card_service.parse_card(self._card_result.card_path)
         if result.is_valid:
-            config = get_config()
             self._card_service.check_mod_availability(
                 result,
-                config.game_mod_path,
-                config.repo_path,
                 self._mod_service.session,
             )
             self._card_result = result

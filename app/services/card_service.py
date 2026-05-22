@@ -89,7 +89,7 @@ class CardParseResult:
     """卡片解析结果"""
     card_path: Path  # 卡片文件路径
     card_name: str  # 卡片文件名
-    card_type: str  # "character" / "fashion" / "unknown"
+    card_type: str  # "角色卡" / "服装卡" / "unknown"
     is_valid: bool  # 是否有效卡片
     error_message: str = ""  # 错误信息
     mods: list[CardModItem] = field(default_factory=list)
@@ -114,21 +114,16 @@ class CardParseResult:
 class CardService:
     """卡片解析服务"""
 
-    # Koikatsu 卡片 PNG 内嵌数据中 GUID 常见格式
-    # 如 "guid":"xxx" 或 modGUID 等字段
-    GUID_PATTERN = re.compile(
-        r'(?:["\'](?:guid|mod_guid|modGUID|ModGUID)["\']\s*[:=]\s*["\'])([^"\']+)(?:["\'])',
-        re.IGNORECASE,
-    )
-
-    # 也可以匹配裸的方括号式 GUID（如 [Author]ModName）
-    BRACKET_GUID_PATTERN = re.compile(
-        r'\[([^\]]+)\]([^",\s\[\]]+)'
-    )
-
     def parse_card(self, card_path: Path) -> CardParseResult:
         """
         解析角色卡/服装卡 PNG 文件，提取依赖的 Mod GUID 列表。
+
+        判断逻辑（BR-C02）：
+          1. 读取 PNG，定位 IEND 末尾
+          2. 检查 IEND 后数据是否包含 KoiKatuClothes 标识
+             → 是 → 服装卡，调用 parse_cloth_card
+             → 否 → 角色卡，调用 parse_character_card
+          3. 对提取的 GUID 统一 strip 处理
 
         Args:
             card_path: PNG 卡片文件路径
@@ -159,6 +154,16 @@ class CardService:
             # 读取 PNG 文件
             data = path.read_bytes()
 
+            # 验证 PNG 签名
+            if data[:8] != SIGNATURE:
+                return CardParseResult(
+                    card_path=path,
+                    card_name=path.name,
+                    card_type="unknown",
+                    is_valid=False,
+                    error_message="文件不是有效的 PNG 格式",
+                )
+
             # 查找 IEND chunk 末尾
             iend_end = self._find_png_end(data)
             if iend_end is None:
@@ -171,37 +176,21 @@ class CardService:
                 )
 
             # 读取 IEND 之后的数据
-            appended = data[iend_end:]
+            extra = data[iend_end:]
+
+            # 判断卡片类型：KoiKatuClothes → 服装卡，否则 → 角色卡
+            is_cloth = self._is_cloth_card(extra)
 
             guids: set[str] = set()
-            cloth_guids: set[str] = set()
-            chara_guids: set[str] = set()
+            if is_cloth:
+                card_type = "服装卡"
+                guids = self.parse_cloth_card(path)
+            else:
+                card_type = "角色卡"
+                guids = self.parse_character_card(path)
 
-            if len(appended) > 4:
-                # 尝试作为 ZIP 解压
-                zip_guids = self._extract_guids_from_zip(appended)
-                if zip_guids:
-                    guids.update(zip_guids)
-
-                # 如果 ZIP 方式没提取到，尝试正则匹配
-                if not guids:
-                    text_guids = self._extract_guids_from_text(appended)
-                    guids.update(text_guids)
-
-                # 服装卡二进制格式：ModID.{xxx}.Slot
-                cloth_guids = self.parse_cloth_card(path)
-                guids.update(cloth_guids)
-
-                # 角色卡 kkloader 格式：universalautoresolver info
-                chara_guids = self.parse_character_card(path)
-                guids.update(chara_guids)
-
-            # 判断卡片类型
-            card_type = self._detect_card_type(appended)
-            if cloth_guids:
-                card_type = "fashion"
-            elif chara_guids:
-                card_type = "character"
+            # 对每个 GUID 做 strip 清洗
+            guids = {g.strip(" !$'\"") for g in guids if g.strip(" !$'\"")}
 
             if not guids:
                 return CardParseResult(
@@ -234,8 +223,6 @@ class CardService:
     def check_mod_availability(
             self,
             result: CardParseResult,
-            game_mod_path: str,
-            repo_path: str,
             db_session: Session,
     ) -> CardParseResult:
         """
@@ -294,6 +281,13 @@ class CardService:
     # ── 内部方法 ──
 
     @staticmethod
+    def _is_cloth_card(extra: bytes) -> bool:
+        """检测 IEND 后数据是否包含 KoiKatuClothes 标识（服装卡）"""
+        if len(extra) < SKIP_AFTER_IEND + len(CHECK_KEY):
+            return False
+        return extra[SKIP_AFTER_IEND:SKIP_AFTER_IEND + len(CHECK_KEY)] == CHECK_KEY
+
+    @staticmethod
     def _find_png_end(data: bytes) -> int | None:
         """查找 PNG IEND chunk 结束位置"""
         # PNG signature: 8 bytes
@@ -307,49 +301,6 @@ class CardService:
                 return offset + chunk_total
             offset += chunk_total
         return None
-
-    def _extract_guids_from_zip(self, data: bytes) -> set[str]:
-        """尝试从 ZIP 数据中提取 GUID"""
-        guids: set[str] = set()
-        try:
-            with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
-                for name in zf.namelist():
-                    if name.endswith("/"):
-                        continue
-                    try:
-                        content = zf.read(name)
-                        # 尝试 JSON 解析
-                        text = content.decode("utf-8", errors="ignore")
-                        guids.update(self._extract_guids_from_text(text.encode("utf-8")))
-                    except Exception:
-                        # 尝试从二进制中匹配 GUID
-                        guids.update(self._extract_guids_from_text(content))
-        except (zipfile.BadZipFile, Exception):
-            pass
-        return guids
-
-    def _extract_guids_from_text(self, data: bytes) -> set[str]:
-        """从文本数据中提取 GUID 引用"""
-        guids: set[str] = set()
-        try:
-            text = data.decode("utf-8", errors="ignore")
-
-            # 方法 1: JSON 风格 GUID 匹配
-            for m in self.GUID_PATTERN.finditer(text):
-                g = m.group(1).strip()
-                if g and len(g) > 2:
-                    guids.add(g)
-
-            # 方法 2: 方括号式 GUID 如 [Author]ModName
-            for m in self.BRACKET_GUID_PATTERN.finditer(text):
-                g = f"[{m.group(1)}]{m.group(2)}"
-                # 过滤明显不是 GUID 的内容
-                if 3 < len(g) < 200:
-                    guids.add(g)
-
-        except Exception:
-            pass
-        return guids
 
     @staticmethod
     def parse_character_card(file_path: Path) -> set[str]:
@@ -475,16 +426,3 @@ class CardService:
         mod_ids = {m.decode("utf-8", errors="ignore") for m in matches}
 
         return mod_ids
-
-    @staticmethod
-    def _detect_card_type(data: bytes) -> str:
-        """尝试判断卡片类型"""
-        try:
-            text = data.decode("utf-8", errors="ignore").lower()
-            if "coordinate" in text or "clothes" in text or "outfit" in text:
-                return "fashion"
-            if "chara" in text or "character" in text:
-                return "character"
-        except Exception:
-            pass
-        return "unknown"

@@ -39,14 +39,14 @@ def setup_logging(log_dir: Path | None = None):
     logger.remove()
 
     # 控制台输出（带颜色，开发友好）
-    # 打包后 sys.stderr 可能为 None，用 string sink 替代
-    stderr_sink = _sys.stderr if _sys.stderr is not None else "<stderr>"
-    logger.add(
-        stderr_sink,
-        level="INFO",
-        format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}",
-        colorize=True,
-    )
+    # 打包后 --windowed 模式没有 stderr，直接跳过控制台日志
+    if _sys.stderr is not None:
+        logger.add(
+            _sys.stderr,
+            level="INFO",
+            format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}",
+            colorize=True,
+        )
 
     # 文件输出（完整调试信息，按天滚动）
     logger.add(

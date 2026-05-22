@@ -616,6 +616,118 @@ class ModService:
         )
 
     # ═══════════════════════════════════════════════════════════
+    # 从游戏添加到仓库
+    # ═══════════════════════════════════════════════════════════
+
+    def add_game_mod_to_repo(self, mod_id: int) -> InstallResult:
+        """
+        将游戏中的 Mod 添加到本地仓库。
+
+        与 install_from_repo 对称的「反向」操作。
+        """
+        game_mod: Mod | None = self.session.get(Mod, mod_id)
+        if game_mod is None:
+            logger.warning("添加仓库失败 - Mod 不存在: ID={}", mod_id)
+            return InstallResult(success=False, message=f"Mod 不存在：ID={mod_id}")
+
+        if game_mod.location != ModLocation.GAME:
+            return InstallResult(
+                success=False,
+                message="只能将游戏中的 Mod 添加到仓库",
+            )
+
+        config = get_config()
+        if not config.repo_path:
+            return InstallResult(
+                success=False,
+                message="请先配置本地 Mod 仓库路径",
+            )
+
+        # 检查仓库中是否已存在
+        repo_dup = (
+            self.session.query(Mod)
+            .filter(
+                Mod.guid == game_mod.guid,
+                Mod.location == ModLocation.REPO,
+            )
+            .first()
+        )
+        if repo_dup is not None:
+            if repo_dup.version == game_mod.version:
+                logger.info("添加到仓库被跳过（仓库已存在同版本）: {} v{}", game_mod.name, game_mod.version)
+                return InstallResult(
+                    success=False,
+                    message=f"仓库中已存在相同版本：{game_mod.name} v{game_mod.version}",
+                )
+            # 版本不同 → 移除仓库旧版本
+            logger.info("添加到仓库 - 移除仓库旧版本: {} v{}", repo_dup.name, repo_dup.version)
+            self._remove_mod_files(repo_dup, config.repo_path)
+            self.session.delete(repo_dup)
+            self.session.flush()
+
+        # 从游戏复制到仓库
+        game_path = Path(config.game_mod_path)
+        repo_path = Path(config.repo_path)
+        author_dir = get_author_dir(game_path, game_mod.author)
+        src_file = author_dir / game_mod.current_file_name
+
+        if not src_file.exists():
+            logger.error("添加到仓库失败 - 游戏文件不存在: {}", src_file)
+            return InstallResult(
+                success=False,
+                message=f"游戏文件不存在：{src_file}",
+            )
+
+        repo_author_dir = get_author_dir(repo_path, game_mod.author)
+        logger.debug("添加到仓库 - 复制: {} → {}", src_file, repo_author_dir)
+        try:
+            dest_file = safe_copy(
+                src=src_file,
+                dst_dir=repo_author_dir,
+                author=game_mod.author or "Unknown",
+                file_name=src_file.name,
+                version=game_mod.version,
+            )
+            logger.info("添加到仓库成功: {} v{} → {}", game_mod.name, game_mod.version, dest_file)
+        except OSError as e:
+            logger.error("添加到仓库文件复制失败: {} - {}", src_file.name, e)
+            return InstallResult(
+                success=False,
+                message=f"文件复制失败：{e}",
+            )
+
+        repo_mod = Mod(
+            guid=game_mod.guid,
+            name=game_mod.name,
+            version=game_mod.version,
+            author=game_mod.author,
+            author_normalized=game_mod.author_normalized,
+            description=game_mod.description,
+            website=game_mod.website,
+            file_name=dest_file.name,
+            location=ModLocation.REPO,
+            status=ModStatus.ENABLED,
+            installed_at=datetime.now(),
+        )
+        self.session.add(repo_mod)
+
+        self._log_operation(
+            operation="repo_add",
+            mod_name=game_mod.name,
+            mod_guid=game_mod.guid,
+            location="repo",
+            detail=f"从游戏添加 v{game_mod.version}",
+        )
+
+        self.session.commit()
+
+        return InstallResult(
+            success=True,
+            message=f"已加入仓库：{game_mod.name} v{game_mod.version}",
+            mod=repo_mod,
+        )
+
+    # ═══════════════════════════════════════════════════════════
     # 查询
     # ═══════════════════════════════════════════════════════════
 

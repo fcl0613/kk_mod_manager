@@ -24,10 +24,13 @@ class ModDetailPanel(QWidget):
     uninstall_requested = pyqtSignal(int)           # mod_id
     enable_requested = pyqtSignal(int, bool)        # mod_id, enabled
     install_to_game_requested = pyqtSignal(int)     # mod_id（从仓库安装到游戏）
+    add_to_repo_requested = pyqtSignal(int)         # mod_id（从游戏添加到仓库）
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._current_mod: Mod | None = None
+        self._is_in_game: bool = False   # 仓库mod是否已在游戏中
+        self._is_in_repo: bool = False   # 游戏mod是否已在仓库中
         self._setup_ui()
 
     def _setup_ui(self):
@@ -95,6 +98,12 @@ class ModDetailPanel(QWidget):
         self.install_game_btn.setVisible(False)
         btn_layout.addWidget(self.install_game_btn)
 
+        self.add_to_repo_btn = QPushButton("加入本地仓库")
+        self.add_to_repo_btn.setObjectName("primary")
+        self.add_to_repo_btn.clicked.connect(self._on_add_to_repo)
+        self.add_to_repo_btn.setVisible(False)
+        btn_layout.addWidget(self.add_to_repo_btn)
+
         self.uninstall_btn = QPushButton("卸载")
         self.uninstall_btn.setObjectName("danger")
         self.uninstall_btn.clicked.connect(self._on_uninstall)
@@ -104,9 +113,17 @@ class ModDetailPanel(QWidget):
         btn_layout.addStretch()
         layout.addWidget(btn_frame)
 
-    def show_mod(self, mod: Mod):
-        """展示 Mod 详情"""
+    def show_mod(self, mod: Mod, is_in_game: bool = False, is_in_repo: bool = False):
+        """展示 Mod 详情
+
+        Args:
+            mod: 要展示的 Mod 对象
+            is_in_game: （仓库mod时）是否已安装到游戏中
+            is_in_repo: （游戏mod时）是否已存在于仓库中
+        """
         self._current_mod = mod
+        self._is_in_game = is_in_game
+        self._is_in_repo = is_in_repo
         config = get_config()
 
         # 基本信息
@@ -148,7 +165,10 @@ class ModDetailPanel(QWidget):
         is_game = mod.location == ModLocation.GAME
         self.enable_btn.setVisible(is_game and mod.status == ModStatus.DISABLED)
         self.disable_btn.setVisible(is_game and mod.status == ModStatus.ENABLED)
-        self.install_game_btn.setVisible(not is_game)
+        # 仓库 Mod：未安装到游戏时才显示"安装到游戏"
+        self.install_game_btn.setVisible(not is_game and not is_in_game)
+        # 游戏 Mod：仓库中不存在时才显示"加入本地仓库"
+        self.add_to_repo_btn.setVisible(is_game and not is_in_repo)
         self.uninstall_btn.setVisible(True)
 
         if is_game:
@@ -159,11 +179,14 @@ class ModDetailPanel(QWidget):
     def clear(self):
         """清空详情"""
         self._current_mod = None
+        self._is_in_game = False
+        self._is_in_repo = False
         for label in self.fields.values():
             label.setText("")
         self.enable_btn.setVisible(False)
         self.disable_btn.setVisible(False)
         self.install_game_btn.setVisible(False)
+        self.add_to_repo_btn.setVisible(False)
         self.uninstall_btn.setVisible(False)
 
     def _on_enable(self, enabled: bool):
@@ -177,16 +200,40 @@ class ModDetailPanel(QWidget):
 
         config = get_config()
         if config.confirm_before_uninstall:
-            loc_text = "卸载" if self._current_mod.location == ModLocation.GAME else "移除"
-            reply = QMessageBox.question(
-                self,
-                f"确认{loc_text}",
-                f"确定要{loc_text}以下 Mod 吗？\n\n"
-                f"名称：{self._current_mod.name}\n"
-                f"版本：{self._current_mod.version}\n"
-                f"作者：{self._current_mod.author or 'Unknown'}",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
+            is_repo = self._current_mod.location == ModLocation.REPO
+            if is_repo and self._is_in_game:
+                # 仓库 Mod 且已安装到游戏中 → 特殊提示
+                reply = QMessageBox.question(
+                    self,
+                    "确认删除",
+                    "当前 Mod 已安装到游戏中，是否继续删除仓库中的 Mod？\n\n"
+                    f"名称：{self._current_mod.name}\n"
+                    f"版本：{self._current_mod.version}\n"
+                    f"作者：{self._current_mod.author or 'Unknown'}",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+            elif is_repo:
+                # 仓库 Mod 未安装到游戏中 → 普通确认
+                reply = QMessageBox.question(
+                    self,
+                    "确认删除",
+                    f"是否确认删除该 Mod？\n\n"
+                    f"名称：{self._current_mod.name}\n"
+                    f"版本：{self._current_mod.version}\n"
+                    f"作者：{self._current_mod.author or 'Unknown'}",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+            else:
+                # 游戏 Mod → 卸载确认
+                reply = QMessageBox.question(
+                    self,
+                    "确认卸载",
+                    f"确定要卸载以下 Mod 吗？\n\n"
+                    f"名称：{self._current_mod.name}\n"
+                    f"版本：{self._current_mod.version}\n"
+                    f"作者：{self._current_mod.author or 'Unknown'}",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
@@ -211,3 +258,22 @@ class ModDetailPanel(QWidget):
             return
 
         self.install_to_game_requested.emit(self._current_mod.id)
+
+    def _on_add_to_repo(self):
+        """从游戏添加到本地仓库"""
+        if self._current_mod is None:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "加入本地仓库",
+            f"确定要将以下 Mod 从游戏加入到本地仓库吗？\n\n"
+            f"名称：{self._current_mod.name}\n"
+            f"版本：{self._current_mod.version}\n"
+            f"作者：{self._current_mod.author or 'Unknown'}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.add_to_repo_requested.emit(self._current_mod.id)

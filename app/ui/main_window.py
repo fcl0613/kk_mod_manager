@@ -139,6 +139,7 @@ class MainWindow(QMainWindow):
         self.detail_panel.uninstall_requested.connect(self._do_uninstall)
         self.detail_panel.enable_requested.connect(self._do_set_enabled)
         self.detail_panel.install_to_game_requested.connect(self._do_install_from_repo)
+        self.detail_panel.add_to_repo_requested.connect(self._do_add_to_repo)
         splitter.addWidget(self.detail_panel)
 
         splitter.setSizes([500, 350])
@@ -569,7 +570,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "操作成功", result.message)
             self._refresh_current()
             if result.mod:
-                self.detail_panel.show_mod(result.mod)
+                is_in_repo = self._mod_service.get_repo_mod_by_guid(result.mod.guid) is not None
+                self.detail_panel.show_mod(result.mod, is_in_game=False, is_in_repo=is_in_repo)
             self.status_bar.showMessage(result.message)
         else:
             QMessageBox.warning(self, "操作失败", result.message)
@@ -589,6 +591,25 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "操作成功", result.message)
             self._refresh_current()
             # 尝试选中新安装到游戏的 Mod
+            self.detail_panel.clear()
+            self.status_bar.showMessage(result.message)
+        else:
+            QMessageBox.warning(self, "操作失败", result.message)
+            self.status_bar.clearMessage()
+
+    def _do_add_to_repo(self, mod_id: int):
+        """从游戏将 Mod 加入本地仓库（详情面板按钮触发）"""
+        mod = self._mod_service.get_mod_by_id(mod_id)
+        if mod is None:
+            return
+
+        logger.info("从游戏添加到仓库: {} (ID={})", mod.name, mod_id)
+        self.status_bar.showMessage(f"正在添加到仓库：{mod.name}...")
+        result = self._mod_service.add_game_mod_to_repo(mod_id)
+
+        if result.success:
+            QMessageBox.information(self, "操作成功", result.message)
+            self._refresh_current()
             self.detail_panel.clear()
             self.status_bar.showMessage(result.message)
         else:
@@ -684,7 +705,11 @@ class MainWindow(QMainWindow):
             return
         mod = self._mod_service.get_mod_by_id(mod_id)
         if mod:
-            self.detail_panel.show_mod(mod)
+            is_game = mod.location == ModLocation.GAME
+            # 检查跨位置存在性
+            is_in_game = not is_game and self._mod_service.get_game_mod_by_guid(mod.guid) is not None
+            is_in_repo = is_game and self._mod_service.get_repo_mod_by_guid(mod.guid) is not None
+            self.detail_panel.show_mod(mod, is_in_game=is_in_game, is_in_repo=is_in_repo)
 
     def _update_status_bar(self):
         """更新状态栏统计"""

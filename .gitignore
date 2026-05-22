@@ -1,0 +1,5 @@
+*.zipmod
+.venv
+.idea
+.workbuddy
+/logs

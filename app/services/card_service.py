@@ -23,7 +23,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 import io
-import json
 import re
 import struct
 import zipfile
@@ -31,7 +30,7 @@ import zipfile
 from sqlalchemy.orm import Session
 
 from app.models.mod import Mod, ModLocation
-
+from kkloader import KoikatuCharaData
 
 SIGNATURE = b'\x89PNG\r\n\x1a\n'
 IEND_TYPE = b'IEND'
@@ -40,6 +39,7 @@ SKIP_AFTER_IEND = 8  # 固定跳过8字节
 SKIP_AFTER_CHECK = 10  # 检测成功后再跳过10字节
 NAME_END_BYTES = b"\x28\x00\x00\xDF\x12\x00\x00"  # 卡片名结束标志
 STOP_TAG = b"<additionalAccessories"
+
 
 class CardModStatus(Enum):
     """卡片中依赖 Mod 的可用性状态"""
@@ -174,6 +174,8 @@ class CardService:
             appended = data[iend_end:]
 
             guids: set[str] = set()
+            cloth_guids: set[str] = set()
+            chara_guids: set[str] = set()
 
             if len(appended) > 4:
                 # 尝试作为 ZIP 解压
@@ -190,10 +192,16 @@ class CardService:
                 cloth_guids = self.parse_cloth_card(path)
                 guids.update(cloth_guids)
 
+                # 角色卡 kkloader 格式：universalautoresolver info
+                chara_guids = self.parse_character_card(path)
+                guids.update(chara_guids)
+
             # 判断卡片类型
             card_type = self._detect_card_type(appended)
             if cloth_guids:
                 card_type = "fashion"
+            elif chara_guids:
+                card_type = "character"
 
             if not guids:
                 return CardParseResult(
@@ -344,6 +352,36 @@ class CardService:
         return guids
 
     @staticmethod
+    def parse_character_card(file_path: Path) -> set[str]:
+        """
+        解析角色卡 PNG 文件，通过 kkloader 提取 sideloader 依赖的 Mod GUID。
+
+        角色卡是 KoiKatuChara 格式，PNG IEND 后嵌入了 msgpack 序列化的
+        角色数据。其中 KKEx 块下的 universalautoresolver info 列表记录了
+        角色所依赖的 Mod GUID。
+
+        Args:
+            file_path: PNG 角色卡文件路径
+
+        Returns:
+            GUID 集合（可能为空）
+        """
+        mod_ids: set[str] = set()
+        try:
+            kc = KoikatuCharaData.load(str(file_path))
+            resolver = kc['KKEx']['com.bepis.sideloader.universalautoresolver']
+            info_list: list[bytes] = resolver[1]['info']
+            start = 8
+            for info in info_list:
+                end = info.find(b'\xa4Slot', start)
+                if end == -1:
+                    continue
+                mod_ids.add(info[start:end].decode('utf-8'))
+        except (KeyError, IndexError, TypeError, ValueError, OSError):
+            pass
+        return mod_ids
+
+    @staticmethod
     def parse_cloth_card(file_path: Path) -> set[str]:
         """
         解析服装卡 PNG 文件，提取 ModID.{xxx}.Slot 格式的 GUID 集合。
@@ -450,5 +488,3 @@ class CardService:
         except Exception:
             pass
         return "unknown"
-
-

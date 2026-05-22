@@ -2,5 +2,7 @@ PyQt6>=6.5.0
 SQLAlchemy>=2.0
 pydantic>=2.0
 loguru>=0.7
-packaging
+packaging~=26.2
 Pillow>=10.0
+
+kkloader>=0.1.20

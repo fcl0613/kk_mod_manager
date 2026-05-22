@@ -1,0 +1,6 @@
+PyQt6>=6.5.0
+SQLAlchemy>=2.0
+pydantic>=2.0
+loguru>=0.7
+packaging
+Pillow>=10.0

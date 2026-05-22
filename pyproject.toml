@@ -1,0 +1,20 @@
+[project]
+name = "kk_mod_manager"
+version = "0.1.0"
+description = "KK Mod Manager - Illusion 系列游戏桌面端 Mod 管理工具"
+requires-python = ">=3.11"
+dependencies = [
+    "PyQt6>=6.5.0",
+    "SQLAlchemy>=2.0",
+    "pydantic>=2.0",
+    "loguru>=0.7",
+    "packaging",
+    "Pillow>=10.0",
+]
+
+[project.scripts]
+kk-mod-manager = "main:main"
+
+[build-system]
+requires = ["setuptools>=69.0"]
+build-backend = "setuptools.build_meta"

@@ -93,6 +93,7 @@ class MainWindow(QMainWindow):
         self.card_page = CardParsePage()
         self.card_page.install_mod_requested.connect(self._on_card_page_install)
         self.card_page.reparse_requested.connect(self._on_card_page_reparse)
+        self.card_page.card_dropped.connect(self._parse_card)
         self.page_stack.addWidget(self.card_page)
 
         main_layout.addWidget(self.page_stack, 1)
@@ -618,7 +619,6 @@ class MainWindow(QMainWindow):
             # 作者分组
             group = QTreeWidgetItem(tree)
             group.setText(0, f"📂 {author}")
-            group.setForeground(0, Qt.GlobalColor.white)
             font = group.font(0)
             font.setBold(True)
             group.setFont(0, font)

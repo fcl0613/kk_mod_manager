@@ -2,7 +2,7 @@
   "game_mod_path": "D:/Koikatsu/mod2",
   "repo_path": "D:/Koikatsu/mod1",
   "remote_repo_url": "",
-  "theme": "light",
+  "theme": "dark",
   "window_width": 1200,
   "window_height": 800,
   "confirm_before_uninstall": true,

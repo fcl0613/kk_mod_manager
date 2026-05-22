@@ -30,6 +30,8 @@ class CardParsePage(QWidget):
     install_mod_requested = pyqtSignal(int)  # mod_id
     # 信号：请求重新解析当前卡片
     reparse_requested = pyqtSignal()
+    # 信号：新卡片拖入/选择，请求解析
+    card_dropped = pyqtSignal(Path)
 
     INSTALLED_COLOR = "#a6e3a1"
     IN_REPO_COLOR = "#f9e2af"
@@ -254,11 +256,9 @@ class CardParsePage(QWidget):
             self._on_card_dropped(Path(file_path))
 
     def _on_card_dropped(self, card_path: Path):
-        """卡片拖入后的处理 — 由外部（MainWindow）调用解析服务"""
-        # 通知 MainWindow 进行解析
-        # 这里暂时只更新 UI 占位，实际解析由 MainWindow 的
-        # show_card_result / set_card_result 方法完成
+        """卡片拖入/选择后，发射信号给 MainWindow 进行解析"""
         self.drop_zone.setText(f"正在解析：{card_path.name}...")
+        self.card_dropped.emit(card_path)
 
     def set_card_result(self, result: CardParseResult):
         """由 MainWindow 调用，展示解析结果"""
@@ -379,7 +379,6 @@ class CardParsePage(QWidget):
         """添加分组行（状态分组标题）"""
         item = QTreeWidgetItem(self.tree)
         item.setText(0, text)
-        item.setForeground(0, Qt.GlobalColor.white)
         font = item.font(0)
         font.setBold(True)
         item.setFont(0, font)
@@ -401,14 +400,6 @@ class CardParsePage(QWidget):
         item.setText(1, mod_info)
         item.setText(2, status_text)
         item.setText(3, "")
-
-        # 根据状态着色
-        if "已安装" in status_text:
-            item.setForeground(2, Qt.GlobalColor.white)
-        elif "仓库有" in status_text:
-            item.setForeground(2, Qt.GlobalColor.white)
-        elif "缺失" in status_text:
-            item.setForeground(0, Qt.GlobalColor.white)
 
         # 操作列：嵌入安装按钮
         if action_text == "安装" and mod_id is not None:

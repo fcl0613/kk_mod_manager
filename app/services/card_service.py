@@ -26,6 +26,7 @@ import re
 import struct
 
 from sqlalchemy.orm import Session
+from loguru import logger
 
 from app.models.mod import Mod, ModLocation
 from kkloader import KoikatuCharaData
@@ -154,6 +155,7 @@ class CardService:
 
             # 验证 PNG 签名
             if data[:8] != SIGNATURE:
+                logger.warning("卡片解析失败 - 非 PNG: {}", path.name)
                 return CardParseResult(
                     card_path=path,
                     card_name=path.name,
@@ -165,6 +167,7 @@ class CardService:
             # 查找 IEND chunk 末尾
             iend_end = self._find_png_end(data)
             if iend_end is None:
+                logger.warning("卡片解析失败 - 无法定位 IEND: {}", path.name)
                 return CardParseResult(
                     card_path=path,
                     card_name=path.name,
@@ -183,14 +186,17 @@ class CardService:
             if is_cloth:
                 card_type = "服装卡"
                 guids = self.parse_cloth_card(path)
+                logger.debug("解析服装卡: {} → {} 个 GUID", path.name, len(guids))
             else:
                 card_type = "角色卡"
                 guids = self.parse_character_card(path)
+                logger.debug("解析角色卡: {} → {} 个 GUID", path.name, len(guids))
 
             # 对每个 GUID 做 strip 清洗
             guids = {g.strip(" !$'\"") for g in guids if g.strip(" !$'\"")}
 
             if not guids:
+                logger.info("卡片解析完成 - 无依赖 Mod: {} ({})", path.name, card_type)
                 return CardParseResult(
                     card_path=path,
                     card_name=path.name,
@@ -200,6 +206,7 @@ class CardService:
                     mods=[],
                 )
 
+            logger.info("卡片解析完成 - {} ({}): {} 个 GUID", path.name, card_type, len(guids))
             return CardParseResult(
                 card_path=path,
                 card_name=path.name,
@@ -210,6 +217,7 @@ class CardService:
             )
 
         except Exception as e:
+            logger.exception("卡片解析异常: {}", path.name)
             return CardParseResult(
                 card_path=path,
                 card_name=path.name,
@@ -229,11 +237,14 @@ class CardService:
         顺序（BR-C03）：
           ① 先查游戏 Mod 路径
           ② 再查仓库路径
-          ③ 都没有 → 标记为缺失
+            ㉃ 都没有 → 标记为缺失
 
         Returns:
             更新了 mods 状态的 CardParseResult
         """
+        installed = 0
+        in_repo = 0
+        missing = 0
         for item in result.mods:
             # ① 查游戏中的 Mod
             game_mod: Mod | None = (
@@ -251,6 +262,7 @@ class CardService:
                 item.mod_author = game_mod.author
                 item.mod_id = game_mod.id
                 item.location = "game"
+                installed += 1
                 continue
 
             # ② 查仓库中的 Mod
@@ -269,11 +281,17 @@ class CardService:
                 item.mod_author = repo_mod.author
                 item.mod_id = repo_mod.id
                 item.location = "repo"
+                in_repo += 1
                 continue
 
             # ③ 都没有 → 缺失
             item.status = CardModStatus.MISSING
+            missing += 1
 
+        logger.info(
+            "卡片 Mod 可用性检查完成: 已安装={}, 仓库有={}, 缺失={}",
+            installed, in_repo, missing,
+        )
         return result
 
     # ── 内部方法 ──

@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QSize, QTimer
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
+from loguru import logger
 
 from app.config import get_config, save_config, reload_config
 from app.database import init_db, get_session
@@ -274,12 +275,14 @@ class MainWindow(QMainWindow):
 
     def _parse_card(self, card_path: Path):
         """解析角色卡/服装卡，并在卡片解析页面显示结果"""
+        logger.info("开始解析卡片: {}", card_path)
         self.status_bar.showMessage(f"正在解析卡片：{card_path.name}...")
 
         # 解析卡片
         result = self._card_service.parse_card(card_path)
 
         if not result.is_valid:
+            logger.warning("卡片解析失败: {} - {}", card_path.name, result.error_message)
             QMessageBox.warning(
                 self,
                 "卡片解析失败",
@@ -305,6 +308,12 @@ class MainWindow(QMainWindow):
         self.card_page.set_card_result(result)
         self.switch_to_card_page()
 
+        logger.info(
+            "卡片解析完成: {} - 总计={} 已安装={} 仓库有={} 缺失={}",
+            card_path.name,
+            result.total_count, result.installed_count,
+            result.in_repo_count, result.missing_count,
+        )
         self.status_bar.showMessage(
             f"卡片解析完成：{result.total_count} 个依赖 Mod | "
             f"已安装 {result.installed_count} | "
@@ -372,6 +381,7 @@ class MainWindow(QMainWindow):
         """卡片解析页：安装单个 Mod"""
         mod = self._mod_service.get_mod_by_id(mod_id)
         name = mod.name if mod else f"ID={mod_id}"
+        logger.info("卡片页安装请求: {} (ID={})", name, mod_id)
         self.status_bar.showMessage(f"正在从仓库安装：{name}...")
 
         success, msg = self.install_repo_mod(mod_id)
@@ -444,6 +454,7 @@ class MainWindow(QMainWindow):
     def _do_install(self, file_path: str, location: ModLocation):
         """执行安装"""
         loc_text = "安装到游戏" if location == ModLocation.GAME else "添加到仓库"
+        logger.info("{} - 开始: {}", loc_text, file_path)
         self.status_bar.showMessage(f"正在{loc_text}...")
 
         # 保存原始路径，用于重试
@@ -462,6 +473,7 @@ class MainWindow(QMainWindow):
     def _handle_install_result(self, result: InstallResult):
         """处理安装结果"""
         if result.success:
+            logger.info("操作成功: {}", result.message)
             QMessageBox.information(self, "操作成功", result.message)
             self._refresh_current()
             self.status_bar.showMessage(result.message)
@@ -511,9 +523,11 @@ class MainWindow(QMainWindow):
                     self._refresh_current()
                     self.status_bar.showMessage(retry.message)
                 else:
+                    logger.warning("重试操作失败: {}", retry.message)
                     QMessageBox.warning(self, "操作失败", retry.message)
                     self.status_bar.clearMessage()
         else:
+            logger.warning("操作失败: {}", result.message)
             QMessageBox.warning(self, "操作失败", result.message)
             self.status_bar.clearMessage()
 
@@ -527,6 +541,7 @@ class MainWindow(QMainWindow):
         if mod is None:
             return
 
+        logger.info("卸载 Mod: {} (ID={})", mod.name, mod_id)
         self.status_bar.showMessage(f"正在卸载：{mod.name}...")
         result = self._mod_service.uninstall(mod_id)
 
@@ -546,6 +561,7 @@ class MainWindow(QMainWindow):
             return
 
         action = "启用" if enabled else "禁用"
+        logger.info("{} Mod: {} (ID={})", action, mod.name, mod_id)
         self.status_bar.showMessage(f"正在{action}：{mod.name}...")
         result = self._mod_service.set_enabled(mod_id, enabled)
 
@@ -565,6 +581,7 @@ class MainWindow(QMainWindow):
         if mod is None:
             return
 
+        logger.info("从仓库安装到游戏: {} (ID={})", mod.name, mod_id)
         self.status_bar.showMessage(f"正在从仓库安装：{mod.name}...")
         result = self._mod_service.install_from_repo(mod_id)
 

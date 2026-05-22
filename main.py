@@ -24,41 +24,7 @@ from loguru import logger
 
 from app.ui.main_window import MainWindow
 from app.config import get_config
-
-
-def setup_logging():
-    """配置日志（按日期滚动，存储在 data/logs/）"""
-    import sys as _sys
-
-    # 确定日志目录
-    if getattr(_sys, 'frozen', False):
-        log_dir = Path(_sys.executable).parent / "logs"
-    else:
-        log_dir = project_root / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    # 移除默认 handler
-    logger.remove()
-
-    # 控制台输出（开发模式）
-    logger.add(
-        _sys.stderr,
-        level="INFO",
-        format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}",
-        colorize=True,
-    )
-
-    # 文件输出（按天滚动）
-    logger.add(
-        log_dir / "kk_mod_manager_{time:YYYY-MM-DD}.log",
-        level="DEBUG",
-        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}",
-        rotation="00:00",    # 每天午夜滚动
-        retention="30 days",  # 保留 30 天
-        encoding="utf-8",
-    )
-
-    logger.info("KK Mod Manager 启动")
+from app.logger import setup_logging
 
 
 def main():

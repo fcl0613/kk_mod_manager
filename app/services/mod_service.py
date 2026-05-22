@@ -17,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy.orm import Session
+from loguru import logger
 
 from app.config import get_config
 from app.models.mod import Mod, ModLocation, ModStatus, OperationLog
@@ -84,7 +85,9 @@ class ModService:
         # 1. 解析元数据
         try:
             manifest = self.manifest_svc.parse_from_zipmod(path)
+            logger.debug("解析 zipmod 成功: name={} version={} guid={}", manifest.name, manifest.version, manifest.guid)
         except ManifestParseError as e:
+            logger.warning("zipmod 解析失败: {} - {}", path.name, e)
             return InstallResult(success=False, message=str(e))
 
         # 2. 检查游戏路径是否配置
@@ -109,6 +112,7 @@ class ModService:
         )
 
         if dup.is_blocked:
+            logger.info("安装被阻止（同版本已存在）: {} v{}", manifest.name, manifest.version)
             return InstallResult(
                 success=False,
                 message=(
@@ -121,6 +125,7 @@ class ModService:
 
         if dup.needs_confirmation:
             if dup.result == DuplicateResult.NEWER_VERSION and not confirm_upgrade:
+                logger.info("需要确认升级: {} v{} → v{}", manifest.name, dup.existing_version, manifest.version)
                 return InstallResult(
                     success=False,
                     message="NEWER_VERSION_NEEDS_CONFIRM",
@@ -128,6 +133,7 @@ class ModService:
                     manifest=manifest,
                 )
             if dup.result == DuplicateResult.OLDER_VERSION and not confirm_downgrade:
+                logger.info("需要确认降级: {} v{} → v{}", manifest.name, dup.existing_version, manifest.version)
                 return InstallResult(
                     success=False,
                     message="OLDER_VERSION_NEEDS_CONFIRM",
@@ -137,12 +143,14 @@ class ModService:
 
         # 4. 如果有旧版本，先删除
         if dup.existing_mod is not None:
+            logger.info("移除旧版本: {} v{} (GUID={})", manifest.name, dup.existing_version, manifest.guid)
             self._remove_mod_files(dup.existing_mod, config.game_mod_path)
             self.session.delete(dup.existing_mod)
             self.session.flush()
 
         # 5. 复制文件到目标目录
         author_dir = get_author_dir(game_root, manifest.author)
+        logger.debug("安装目标目录: {}", author_dir)
 
         try:
             dest_file = safe_copy(
@@ -152,7 +160,9 @@ class ModService:
                 file_name=path.name,
                 version=manifest.version,
             )
+            logger.info("文件复制成功: {} → {}", path.name, dest_file)
         except OSError as e:
+            logger.error("文件复制失败: {} → {} - {}", path.name, author_dir, e)
             return InstallResult(
                 success=False,
                 message=f"文件复制失败：{e}",
@@ -214,7 +224,9 @@ class ModService:
         # 1. 解析
         try:
             manifest = self.manifest_svc.parse_from_zipmod(path)
+            logger.debug("解析 zipmod 成功(add_to_repo): name={} version={}", manifest.name, manifest.version)
         except ManifestParseError as e:
+            logger.warning("zipmod 解析失败(add_to_repo): {} - {}", path.name, e)
             return InstallResult(success=False, message=str(e))
 
         # 2. 校验仓库路径
@@ -239,6 +251,7 @@ class ModService:
         )
 
         if dup.is_blocked:
+            logger.info("添加到仓库被阻止（同版本已存在）: {} v{}", manifest.name, manifest.version)
             return InstallResult(
                 success=False,
                 message=f"仓库中已存在相同版本的 Mod：{manifest.name} v{manifest.version}",
@@ -270,6 +283,7 @@ class ModService:
 
         # 5. 复制
         author_dir = get_author_dir(repo_root, manifest.author)
+        logger.debug("仓库目标目录: {}", author_dir)
 
         try:
             dest_file = safe_copy(
@@ -279,7 +293,9 @@ class ModService:
                 file_name=path.name,
                 version=manifest.version,
             )
+            logger.info("添加到仓库成功: {} → {}", path.name, dest_file)
         except OSError as e:
+            logger.error("添加到仓库文件复制失败: {} - {}", path.name, e)
             return InstallResult(
                 success=False,
                 message=f"文件复制失败：{e}",
@@ -332,6 +348,7 @@ class ModService:
         """
         安装并收藏：先添加到仓库，再安装到游戏（Q-02 确认流程）。
         """
+        logger.info("执行安装并收藏: {}", zipmod_path.name)
         # 先添加到仓库
         repo_result = self.add_to_repo(
             zipmod_path,
@@ -339,6 +356,7 @@ class ModService:
             confirm_downgrade=confirm_downgrade,
         )
         if not repo_result.success:
+            logger.warning("安装并收藏 - 添加到仓库失败: {}", repo_result.message)
             return repo_result
 
         # 再从仓库安装到游戏
@@ -363,6 +381,7 @@ class ModService:
         """卸载游戏中的 Mod 或从仓库移除"""
         mod: Mod | None = self.session.get(Mod, mod_id)
         if mod is None:
+            logger.warning("卸载失败 - Mod 不存在: ID={}", mod_id)
             return InstallResult(success=False, message=f"Mod 不存在：ID={mod_id}")
 
         config = get_config()
@@ -378,7 +397,9 @@ class ModService:
         if file_path.exists():
             try:
                 delete_file(file_path)
+                logger.info("删除文件: {}", file_path)
             except OSError as e:
+                logger.error("删除文件失败: {} - {}", file_path, e)
                 return InstallResult(
                     success=False,
                     message=f"删除文件失败：{e}",
@@ -443,23 +464,27 @@ class ModService:
             old_path = author_dir / mod.is_disabled_file
             new_path = rename_extension(old_path, ".zipmod_disabled", ".zipmod")
             if new_path is None:
+                logger.warning("启用失败 - 文件不存在: {}", old_path)
                 return InstallResult(
                     success=False,
                     message=f"启用失败：文件不存在 {old_path}",
                 )
             mod.file_name = new_path.name
             mod.status = ModStatus.ENABLED
+            logger.info("启用 Mod: {} → {}", old_path, new_path)
         else:
             # 禁用：.zipmod → .zipmod_disabled
             old_path = author_dir / mod.file_name
             new_path = rename_extension(old_path, ".zipmod", ".zipmod_disabled")
             if new_path is None:
+                logger.warning("禁用失败 - 文件不存在: {}", old_path)
                 return InstallResult(
                     success=False,
                     message=f"禁用失败：文件不存在 {old_path}",
                 )
             mod.file_name = new_path.name
             mod.status = ModStatus.DISABLED
+            logger.info("禁用 Mod: {} → {}", old_path, new_path)
 
         op_type = "enable" if enabled else "disable"
         self._log_operation(
@@ -490,6 +515,7 @@ class ModService:
         """
         repo_mod: Mod | None = self.session.get(Mod, mod_id)
         if repo_mod is None:
+            logger.warning("从仓库安装失败 - Mod 不存在: ID={}", mod_id)
             return InstallResult(success=False, message=f"Mod 不存在：ID={mod_id}")
 
         if repo_mod.location != ModLocation.REPO:
@@ -516,11 +542,13 @@ class ModService:
         )
         if game_dup is not None:
             if game_dup.version == repo_mod.version:
+                logger.info("从仓库安装被跳过（游戏已安装同版本）: {} v{}", repo_mod.name, repo_mod.version)
                 return InstallResult(
                     success=False,
                     message=f"游戏已安装相同版本：{repo_mod.name} v{repo_mod.version}",
                 )
             # 版本不同 → 当作升级处理
+            logger.info("从仓库安装 - 移除游戏旧版本: {} v{}", game_dup.name, game_dup.version)
             self._remove_mod_files(game_dup, config.game_mod_path)
             self.session.delete(game_dup)
             self.session.flush()
@@ -532,12 +560,14 @@ class ModService:
         src_file = author_dir / repo_mod.current_file_name
 
         if not src_file.exists():
+            logger.error("从仓库安装失败 - 仓库文件不存在: {}", src_file)
             return InstallResult(
                 success=False,
                 message=f"仓库中文件不存在：{src_file}",
             )
 
         game_author_dir = get_author_dir(game_path, repo_mod.author)
+        logger.debug("从仓库安装 - 复制: {} → {}", src_file, game_author_dir)
         try:
             dest_file = safe_copy(
                 src=src_file,
@@ -546,7 +576,9 @@ class ModService:
                 file_name=src_file.name,
                 version=repo_mod.version,
             )
+            logger.info("从仓库安装成功: {} v{} → {}", repo_mod.name, repo_mod.version, dest_file)
         except OSError as e:
+            logger.error("从仓库安装文件复制失败: {} - {}", src_file.name, e)
             return InstallResult(
                 success=False,
                 message=f"文件复制失败：{e}",

@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QSize
 from PyQt6.QtGui import QPixmap, QDragEnterEvent, QDropEvent
+from loguru import logger
 
 from app.services.card_service import (
     CardParseResult,
@@ -253,10 +254,12 @@ class CardParsePage(QWidget):
             "PNG 文件 (*.png);;所有文件 (*.*)",
         )
         if file_path:
+            logger.debug("用户选择卡片: {}", file_path)
             self._on_card_dropped(Path(file_path))
 
     def _on_card_dropped(self, card_path: Path):
         """卡片拖入/选择后，发射信号给 MainWindow 进行解析"""
+        logger.info("收到卡片: {}", card_path)
         self.drop_zone.setText(f"正在解析：{card_path.name}...")
         self.card_dropped.emit(card_path)
 

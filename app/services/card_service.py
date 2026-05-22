@@ -22,10 +22,8 @@ Koikatsu 卡片格式:
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-import io
 import re
 import struct
-import zipfile
 
 from sqlalchemy.orm import Session
 

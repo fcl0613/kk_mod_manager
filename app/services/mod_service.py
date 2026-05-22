@@ -18,7 +18,7 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
-from app.config import get_config, AppConfig
+from app.config import get_config
 from app.models.mod import Mod, ModLocation, ModStatus, OperationLog
 from app.services.manifest_service import (
     ManifestService,

@@ -18,11 +18,10 @@ from PyQt6.QtWidgets import (
     QSplitter, QFrame, QMessageBox, QApplication,
 )
 from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtGui import QPixmap, QFont
+from PyQt6.QtGui import QPixmap
 
 from app.services.card_service import (
     CardParseResult,
-    CardModItem,
     CardModStatus,
 )
 

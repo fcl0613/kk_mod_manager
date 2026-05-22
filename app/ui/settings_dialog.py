@@ -11,13 +11,11 @@
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout,
-    QLabel, QLineEdit, QPushButton, QCheckBox, QComboBox,
-    QGroupBox, QFormLayout, QFileDialog, QMessageBox,
+    QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton, QCheckBox, QComboBox,
+    QGroupBox, QFormLayout, QFileDialog,
 )
-from PyQt6.QtCore import Qt
 
-from app.config import AppConfig, get_config, save_config
+from app.config import get_config, save_config
 
 
 class SettingsDialog(QDialog):

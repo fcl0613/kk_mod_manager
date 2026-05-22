@@ -11,7 +11,6 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QFrame,
 )
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont
 
 from app.services.manifest_service import (
     ModManifest,

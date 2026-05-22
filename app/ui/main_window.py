@@ -11,21 +11,19 @@
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QMainWindow, QWidget, QVBoxLayout,
     QToolBar, QPushButton, QLineEdit, QLabel,
     QTreeWidget, QTreeWidgetItem, QSplitter,
     QTabWidget, QStatusBar, QFileDialog, QMessageBox,
-    QFrame, QApplication,
 )
 from PyQt6.QtCore import Qt, QSize, QTimer
-from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QFont, QAction
+from PyQt6.QtGui import QDragEnterEvent, QDropEvent
 
-from app.config import get_config, save_config, reload_config, AppConfig
+from app.config import get_config, save_config, reload_config
 from app.database import init_db, get_session
 from app.models.mod import Mod, ModLocation, ModStatus
 from app.services.mod_service import ModService, InstallResult
 from app.services.card_service import CardService, CardParseResult
-from app.services.manifest_service import DuplicateResult
 from app.ui.settings_dialog import SettingsDialog
 from app.ui.install_dialog import InstallConfirmDialog
 from app.ui.mod_detail_panel import ModDetailPanel

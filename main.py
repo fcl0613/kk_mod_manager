@@ -20,7 +20,6 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import Qt
 from loguru import logger
 
 from app.ui.main_window import MainWindow

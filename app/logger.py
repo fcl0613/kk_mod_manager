@@ -28,9 +28,10 @@ def setup_logging(log_dir: Path | None = None):
     # 确定日志目录
     if log_dir is None:
         if getattr(_sys, 'frozen', False):
+            # PyInstaller 打包后：exe 同级目录
             log_dir = Path(_sys.executable).parent / "logs"
         else:
-            # 往上两级：app/logger.py → 项目根目录
+            # 开发模式：logger.py 所在目录的上两级（项目根目录）
             log_dir = Path(__file__).parent.parent / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -38,8 +39,10 @@ def setup_logging(log_dir: Path | None = None):
     logger.remove()
 
     # 控制台输出（带颜色，开发友好）
+    # 打包后 sys.stderr 可能为 None，用 string sink 替代
+    stderr_sink = _sys.stderr if _sys.stderr is not None else "<stderr>"
     logger.add(
-        _sys.stderr,
+        stderr_sink,
         level="INFO",
         format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}",
         colorize=True,

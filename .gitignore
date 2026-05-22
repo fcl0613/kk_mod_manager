@@ -3,3 +3,5 @@
 .idea
 .workbuddy
 /logs
+/build
+/dist

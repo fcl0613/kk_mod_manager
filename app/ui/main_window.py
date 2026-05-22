@@ -2,9 +2,9 @@
 
 需求文档 v1.3 - 7.1 主窗口布局：
   - 顶部工具栏（安装/添加/设置按钮，搜索框）
-  - 顶部卡片分析区（拖放区域）
-  - 左侧 Mod 列表区（按作者分组，Tab 切换游戏/仓库）
-  - 右侧详情面板
+  - 顶层 TabBar（Mod管理 / 解析卡片）
+  - Mod管理页：卡片拖放区 + 左侧 Mod 列表 + 右侧详情面板
+  - 解析卡片页：图片预览 + Mod 依赖列表（GUID|Mod名称|状态|操作）
   - 底部状态栏
 """
 
@@ -14,7 +14,8 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout,
     QToolBar, QPushButton, QLineEdit, QLabel,
     QTreeWidget, QTreeWidgetItem, QSplitter,
-    QTabWidget, QStatusBar, QFileDialog, QMessageBox,
+    QTabWidget, QTabBar, QStackedWidget,
+    QStatusBar, QFileDialog, QMessageBox,
 )
 from PyQt6.QtCore import Qt, QSize, QTimer
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
@@ -28,6 +29,7 @@ from app.ui.settings_dialog import SettingsDialog
 from app.ui.install_dialog import InstallConfirmDialog
 from app.ui.mod_detail_panel import ModDetailPanel
 from app.ui.card_result_dialog import CardResultDialog
+from app.ui.card_parse_page import CardParsePage
 
 
 class MainWindow(QMainWindow):
@@ -49,6 +51,10 @@ class MainWindow(QMainWindow):
         self._load_theme()
         self._check_first_run()
 
+        # 首次启动加载已有数据
+        self._refresh_game_list()
+        self._update_status_bar()
+
     # ═══════════════════════════════════════════════════════
     # UI 构建
     # ═══════════════════════════════════════════════════════
@@ -63,18 +69,64 @@ class MainWindow(QMainWindow):
         # 允许拖放
         self.setAcceptDrops(True)
 
+        # ── 工具栏 ──
+        self._create_toolbar()
+
         # ── 中央部件 ──
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(8, 8, 8, 8)
-        main_layout.setSpacing(8)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
-        # ── 工具栏 ──
-        self._create_toolbar()
+        # ── 顶层 Tab 导航栏 ──
+        self._create_top_tab_bar(main_layout)
+
+        # ── 页面栈 ──
+        self.page_stack = QStackedWidget()
+
+        # Page 0: Mod 管理页面
+        self.mod_page = self._create_mod_page()
+        self.page_stack.addWidget(self.mod_page)
+
+        # Page 1: 解析卡片页面
+        self.card_page = CardParsePage()
+        self.card_page.install_mod_requested.connect(self._on_card_page_install)
+        self.card_page.reparse_requested.connect(self._on_card_page_reparse)
+        self.page_stack.addWidget(self.card_page)
+
+        main_layout.addWidget(self.page_stack, 1)
+
+        # ── 状态栏 ──
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self._update_status_bar()
+
+    def _create_top_tab_bar(self, parent_layout: QVBoxLayout):
+        """创建顶层 Tab 导航栏"""
+        self.top_tab_bar = QTabBar()
+        self.top_tab_bar.addTab("📦 Mod 管理")
+        self.top_tab_bar.addTab("📋 解析卡片")
+        self.top_tab_bar.currentChanged.connect(self._on_top_tab_changed)
+
+        # 设置 TabBar 样式
+        self.top_tab_bar.setStyleSheet(
+            "QTabBar::tab {"
+            "  padding: 8px 20px;"
+            "  font-size: 14px;"
+            "}"
+        )
+        parent_layout.addWidget(self.top_tab_bar)
+
+    def _create_mod_page(self) -> QWidget:
+        """创建 Mod 管理页面（原有内容）"""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
 
         # ── 卡片拖放区 ──
-        self._create_card_drop_zone(main_layout)
+        self._create_card_drop_zone(layout)
 
         # ── 主内容区（左右分栏）──
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -91,12 +143,9 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.detail_panel)
 
         splitter.setSizes([500, 350])
-        main_layout.addWidget(splitter, 1)
+        layout.addWidget(splitter, 1)
 
-        # ── 状态栏 ──
-        self.status_bar = QStatusBar()
-        self.setStatusBar(self.status_bar)
-        self._update_status_bar()
+        return page
 
     def _create_toolbar(self):
         """创建顶部工具栏"""
@@ -179,7 +228,7 @@ class MainWindow(QMainWindow):
         self.repo_tree = self._create_mod_tree()
         self.tab_widget.addTab(self.repo_tree, "📁 仓库 Mod")
 
-        self.tab_widget.currentChanged.connect(self._on_tab_changed)
+        self.tab_widget.currentChanged.connect(self._on_mod_tab_changed)
         layout.addWidget(self.tab_widget)
 
         return panel
@@ -198,6 +247,26 @@ class MainWindow(QMainWindow):
         return tree
 
     # ═══════════════════════════════════════════════════════
+    # 顶层 Tab 导航
+    # ═══════════════════════════════════════════════════════
+
+    def _on_top_tab_changed(self, index: int):
+        """顶层 TabBar 切换（SPA 页面切换）"""
+        self.page_stack.setCurrentIndex(index)
+        if index == 0:
+            # 切换到 Mod 管理页
+            self._refresh_current()
+        elif index == 1:
+            # 切换到解析卡片页
+            if self._card_result is not None:
+                self.card_page.set_card_result(self._card_result)
+
+    def switch_to_card_page(self):
+        """切换到卡片解析页面"""
+        self.top_tab_bar.setCurrentIndex(1)
+        self.page_stack.setCurrentIndex(1)
+
+    # ═══════════════════════════════════════════════════════
     # 拖放处理（用于卡片拖放）
     # ═══════════════════════════════════════════════════════
 
@@ -208,29 +277,36 @@ class MainWindow(QMainWindow):
                 path = Path(url.toLocalFile())
                 if path.suffix.lower() == ".png":
                     event.acceptProposedAction()
-                    self.drop_zone.setStyleSheet(
-                        "QLabel {"
-                        "  background-color: #2a3a4a;"
-                        "  border: 2px dashed #89b4fa;"
-                        "  border-radius: 8px;"
-                        "  color: #89b4fa;"
-                        "  font-size: 14px;"
-                        "}"
-                    )
+                    self._highlight_drop_zone(True)
                     return
         event.ignore()
 
     def dragLeaveEvent(self, event):
-        self._reset_drop_zone_style()
+        self._highlight_drop_zone(False)
 
     def dropEvent(self, event: QDropEvent):
-        self._reset_drop_zone_style()
+        self._highlight_drop_zone(False)
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
                 path = Path(url.toLocalFile())
                 if path.suffix.lower() == ".png":
                     self._parse_card(path)
                     break
+
+    def _highlight_drop_zone(self, active: bool):
+        """高亮 Mod 管理页的拖放区"""
+        if active:
+            self.drop_zone.setStyleSheet(
+                "QLabel {"
+                "  background-color: #2a3a4a;"
+                "  border: 2px dashed #89b4fa;"
+                "  border-radius: 8px;"
+                "  color: #89b4fa;"
+                "  font-size: 14px;"
+                "}"
+            )
+        else:
+            self._reset_drop_zone_style()
 
     def _reset_drop_zone_style(self):
         self.drop_zone.setStyleSheet(
@@ -248,7 +324,7 @@ class MainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════
 
     def _parse_card(self, card_path: Path):
-        """解析角色卡/服装卡"""
+        """解析角色卡/服装卡，并在卡片解析页面显示结果"""
         self.status_bar.showMessage(f"正在解析卡片：{card_path.name}...")
 
         # 解析卡片
@@ -271,7 +347,39 @@ class MainWindow(QMainWindow):
 
         self._card_result = result
 
-        # 显示结果
+        # 切换到解析卡片页面并显示结果
+        self.card_page.set_card_result(result)
+        self.switch_to_card_page()
+
+        self.status_bar.showMessage(
+            f"卡片解析完成：{result.total_count} 个依赖 Mod | "
+            f"已安装 {result.installed_count} | "
+            f"仓库有 {result.in_repo_count} | "
+            f"缺失 {result.missing_count}"
+        )
+
+    def _parse_card_and_show_dialog(self, card_path: Path):
+        """解析卡片并在对话框中显示（保留旧接口兼容）"""
+        self.status_bar.showMessage(f"正在解析卡片：{card_path.name}...")
+
+        result = self._card_service.parse_card(card_path)
+
+        if not result.is_valid:
+            QMessageBox.warning(
+                self,
+                "卡片解析失败",
+                result.error_message,
+            )
+            self.status_bar.clearMessage()
+            return
+
+        self._card_service.check_mod_availability(
+            result,
+            self._mod_service.session,
+        )
+
+        self._card_result = result
+
         dialog = CardResultDialog(result, self)
         dialog.show()
 
@@ -301,6 +409,31 @@ class MainWindow(QMainWindow):
         if result.success:
             self._refresh_current()
         return result.success, result.message
+
+    # ═══════════════════════════════════════════════════════
+    # 卡片解析页面信号回调
+    # ═══════════════════════════════════════════════════════
+
+    def _on_card_page_install(self, mod_id: int):
+        """卡片解析页：安装单个 Mod"""
+        mod = self._mod_service.get_mod_by_id(mod_id)
+        name = mod.name if mod else f"ID={mod_id}"
+        self.status_bar.showMessage(f"正在从仓库安装：{name}...")
+
+        success, msg = self.install_repo_mod(mod_id)
+        QMessageBox.information(self, "安装结果", msg)
+
+        if success:
+            # 重新解析卡片并刷新页面
+            new_result = self.reparse_card()
+            if new_result:
+                self.card_page.set_card_result(new_result)
+
+    def _on_card_page_reparse(self):
+        """卡片解析页：请求重新解析（全部安装后）"""
+        new_result = self.reparse_card()
+        if new_result:
+            self.card_page.set_card_result(new_result)
 
     # ═══════════════════════════════════════════════════════
     # Mod 安装/添加
@@ -496,7 +629,7 @@ class MainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════
 
     def _refresh_current(self):
-        """刷新当前 Tab 的 Mod 列表"""
+        """刷新当前 Mod Tab 的列表"""
         idx = self.tab_widget.currentIndex()
         if idx == 0:
             self._refresh_game_list()
@@ -567,7 +700,8 @@ class MainWindow(QMainWindow):
     # 事件处理
     # ═══════════════════════════════════════════════════════
 
-    def _on_tab_changed(self, index: int):
+    def _on_mod_tab_changed(self, index: int):
+        """Mod 管理页内部的 Tab 切换（游戏/仓库）"""
         self._refresh_current()
         self.detail_panel.clear()
 

@@ -31,6 +31,7 @@ from app.ui.install_dialog import InstallConfirmDialog
 from app.ui.mod_detail_panel import ModDetailPanel
 from app.ui.card_result_dialog import CardResultDialog
 from app.ui.card_parse_page import CardParsePage
+from app.ui.batch_install_dialog import BatchInstallDialog
 
 
 class MainWindow(QMainWindow):
@@ -168,6 +169,20 @@ class MainWindow(QMainWindow):
         both_btn = QPushButton("📦+📁 安装并收藏")
         both_btn.clicked.connect(self._install_and_collect)
         toolbar.addWidget(both_btn)
+
+        toolbar.addSeparator()
+
+        # 批量添加到游戏
+        batch_game_btn = QPushButton("🗂 批量→游戏")
+        batch_game_btn.setToolTip("批量添加多个 .zipmod 文件到游戏 Mod 目录")
+        batch_game_btn.clicked.connect(lambda: self._batch_install(ModLocation.GAME))
+        toolbar.addWidget(batch_game_btn)
+
+        # 批量添加到仓库
+        batch_repo_btn = QPushButton("🗂 批量→仓库")
+        batch_repo_btn.setToolTip("批量添加多个 .zipmod 文件到本地仓库")
+        batch_repo_btn.clicked.connect(lambda: self._batch_install(ModLocation.REPO))
+        toolbar.addWidget(batch_repo_btn)
 
         toolbar.addSeparator()
 
@@ -451,6 +466,20 @@ class MainWindow(QMainWindow):
         self._pending_location = ModLocation.REPO  # 先装仓库
         result = self._mod_service.install_and_collect(file_path)
         self._handle_install_result(result)
+
+    def _batch_install(self, location: ModLocation):
+        """批量安装 Mod"""
+        config = get_config()
+        if location == ModLocation.GAME and not config.game_mod_path:
+            QMessageBox.warning(self, "提示", "请先在设置中配置游戏 Mod 路径")
+            return
+        if location == ModLocation.REPO and not config.repo_path:
+            QMessageBox.warning(self, "提示", "请先在设置中配置本地仓库路径")
+            return
+
+        dialog = BatchInstallDialog(self._mod_service, location, parent=self)
+        dialog.install_finished.connect(self._refresh_current)
+        dialog.exec()
 
     def _do_install(self, file_path: str, location: ModLocation):
         """执行安装"""

@@ -12,9 +12,11 @@
   - 双重检测（游戏+仓库）防止重复
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
+from typing import Callable
 
 from sqlalchemy.orm import Session
 from loguru import logger
@@ -45,6 +47,50 @@ class InstallResult:
     mod: Mod | None = None
     duplicate_report: DuplicateReport | None = None
     manifest: ModManifest | None = None
+
+
+# ═══════════════════════════════════════════════════════════
+# 批量安装相关数据类
+# ═══════════════════════════════════════════════════════════
+
+class BatchItemStatus(Enum):
+    """批量安装单项状态"""
+    PENDING = "pending"         # 等待处理
+    SUCCESS = "success"         # 成功
+    SKIPPED = "skipped"         # 跳过（同版本已存在）
+    CONFLICT = "conflict"       # 版本冲突（需用户处理）
+    FAILED = "failed"           # 解析或复制失败
+
+
+@dataclass
+class BatchItemResult:
+    """批量安装单条结果"""
+    file_path: Path
+    status: BatchItemStatus
+    message: str
+    manifest: ModManifest | None = None
+    duplicate_report: DuplicateReport | None = None
+
+
+@dataclass
+class BatchInstallResult:
+    """批量安装总结果"""
+    total: int = 0
+    success_count: int = 0
+    skipped_count: int = 0
+    conflict_count: int = 0
+    failed_count: int = 0
+    items: list[BatchItemResult] = field(default_factory=list)
+
+    @property
+    def conflicts(self) -> list[BatchItemResult]:
+        """返回所有版本冲突项"""
+        return [i for i in self.items if i.status == BatchItemStatus.CONFLICT]
+
+    @property
+    def failures(self) -> list[BatchItemResult]:
+        """返回所有失败项"""
+        return [i for i in self.items if i.status == BatchItemStatus.FAILED]
 
 
 class ModService:
@@ -870,6 +916,232 @@ class ModService:
 
         self.session.commit()
         return count
+
+    # ═══════════════════════════════════════════════════════════
+    # 批量安装（Batch Install）
+    # ═══════════════════════════════════════════════════════════
+
+    @staticmethod
+    def collect_zipmods(paths: list[Path]) -> list[Path]:
+        """
+        从给定路径列表中收集所有 .zipmod 文件。
+
+        - 如果 path 是文件且后缀为 .zipmod，直接加入
+        - 如果 path 是目录，递归查找所有 .zipmod（含 .zipmod_disabled）
+
+        Returns:
+            去重后的 .zipmod 文件路径列表
+        """
+        result: list[Path] = []
+        seen: set[Path] = set()
+
+        for p in paths:
+            if p.is_file():
+                if p.suffix.lower() in (".zipmod", ".zipmod_disabled"):
+                    resolved = p.resolve()
+                    if resolved not in seen:
+                        seen.add(resolved)
+                        result.append(p)
+            elif p.is_dir():
+                for f in sorted(p.rglob("*")):
+                    if f.is_file() and f.suffix.lower() in (".zipmod", ".zipmod_disabled"):
+                        resolved = f.resolve()
+                        if resolved not in seen:
+                            seen.add(resolved)
+                            result.append(f)
+
+        return result
+
+    def batch_install(
+        self,
+        zipmod_paths: list[Path],
+        location: ModLocation,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> BatchInstallResult:
+        """
+        批量安装 / 添加 Mod。
+
+        遇到版本冲突（NEWER / OLDER / UNKNOWN）时不中断，
+        记录为 CONFLICT，让用户事后处理；
+        遇到同版本重复时记录为 SKIPPED；
+        其他错误记录为 FAILED。
+
+        Args:
+            zipmod_paths: 要安装的 .zipmod 文件列表
+            location: 目标位置（GAME / REPO）
+            progress_callback: 可选进度回调 (current, total, file_name)
+
+        Returns:
+            BatchInstallResult 包含每个文件的处理结果
+        """
+        batch = BatchInstallResult(total=len(zipmod_paths))
+        config = get_config()
+
+        # 验证目标路径
+        if location == ModLocation.GAME:
+            base_path_str = config.game_mod_path
+            path_label = "游戏 Mod 路径"
+        else:
+            base_path_str = config.repo_path
+            path_label = "仓库路径"
+
+        if not base_path_str:
+            for fp in zipmod_paths:
+                batch.items.append(BatchItemResult(
+                    file_path=fp,
+                    status=BatchItemStatus.FAILED,
+                    message=f"未配置{path_label}，请先在设置中配置",
+                ))
+                batch.failed_count += 1
+            return batch
+
+        base_path = Path(base_path_str)
+        if not base_path.exists():
+            for fp in zipmod_paths:
+                batch.items.append(BatchItemResult(
+                    file_path=fp,
+                    status=BatchItemStatus.FAILED,
+                    message=f"{path_label}不存在：{base_path_str}",
+                ))
+                batch.failed_count += 1
+            return batch
+
+        for idx, fp in enumerate(zipmod_paths):
+            if progress_callback:
+                progress_callback(idx, len(zipmod_paths), fp.name)
+
+            item = self._batch_install_single(fp, location, base_path)
+            batch.items.append(item)
+
+            if item.status == BatchItemStatus.SUCCESS:
+                batch.success_count += 1
+            elif item.status == BatchItemStatus.SKIPPED:
+                batch.skipped_count += 1
+            elif item.status == BatchItemStatus.CONFLICT:
+                batch.conflict_count += 1
+            else:
+                batch.failed_count += 1
+
+        if progress_callback:
+            progress_callback(len(zipmod_paths), len(zipmod_paths), "完成")
+
+        logger.info(
+            "批量安装完成: 总={} 成功={} 跳过={} 冲突={} 失败={}",
+            batch.total, batch.success_count,
+            batch.skipped_count, batch.conflict_count, batch.failed_count,
+        )
+        return batch
+
+    def _batch_install_single(
+        self,
+        fp: Path,
+        location: ModLocation,
+        base_path: Path,
+    ) -> BatchItemResult:
+        """批量安装中处理单个文件，不抛异常，结果封装为 BatchItemResult"""
+        # 1. 解析 manifest
+        try:
+            manifest = self.manifest_svc.parse_from_zipmod(fp)
+        except ManifestParseError as e:
+            logger.warning("批量安装 - 解析失败: {} - {}", fp.name, e)
+            return BatchItemResult(
+                file_path=fp,
+                status=BatchItemStatus.FAILED,
+                message=str(e),
+            )
+
+        # 2. 重复检测
+        dup = self.manifest_svc.check_duplicate(manifest, location, self.session)
+
+        if dup.is_blocked:
+            # 同版本已存在，跳过
+            logger.debug("批量安装 - 跳过（同版本）: {} v{}", manifest.name, manifest.version)
+            return BatchItemResult(
+                file_path=fp,
+                status=BatchItemStatus.SKIPPED,
+                message=f"已存在相同版本：{manifest.name} v{manifest.version}",
+                manifest=manifest,
+                duplicate_report=dup,
+            )
+
+        if dup.needs_confirmation:
+            # 版本不同，记录为冲突，不自动处理
+            logger.debug(
+                "批量安装 - 版本冲突: {} 已有=v{} 待装=v{}",
+                manifest.name, dup.existing_version, manifest.version,
+            )
+            return BatchItemResult(
+                file_path=fp,
+                status=BatchItemStatus.CONFLICT,
+                message=(
+                    f"版本冲突：已有 v{dup.existing_version}，"
+                    f"待添加 v{manifest.version}"
+                ),
+                manifest=manifest,
+                duplicate_report=dup,
+            )
+
+        # 3. 移除旧版本（正常情况不会到这里，但防御性处理）
+        if dup.existing_mod is not None:
+            config = get_config()
+            base_str = config.game_mod_path if location == ModLocation.GAME else config.repo_path
+            self._remove_mod_files(dup.existing_mod, base_str)
+            self.session.delete(dup.existing_mod)
+            self.session.flush()
+
+        # 4. 复制文件
+        author_dir = get_author_dir(base_path, manifest.author)
+        try:
+            dest_file = safe_copy(
+                src=fp,
+                dst_dir=author_dir,
+                author=manifest.display_author,
+                file_name=fp.name,
+                version=manifest.version,
+            )
+        except OSError as e:
+            logger.error("批量安装 - 复制失败: {} - {}", fp.name, e)
+            return BatchItemResult(
+                file_path=fp,
+                status=BatchItemStatus.FAILED,
+                message=f"文件复制失败：{e}",
+                manifest=manifest,
+            )
+
+        # 5. 写入数据库
+        mod = Mod(
+            guid=manifest.guid,
+            name=manifest.name,
+            version=manifest.version,
+            author=manifest.author,
+            author_normalized=manifest.author_normalized,
+            description=manifest.description,
+            website=manifest.website,
+            file_name=dest_file.name,
+            location=location,
+            status=ModStatus.ENABLED,
+            installed_at=datetime.now(),
+        )
+        self.session.add(mod)
+
+        op_type = "install" if location == ModLocation.GAME else "repo_add"
+        loc_label = "game" if location == ModLocation.GAME else "repo"
+        self._log_operation(
+            operation=op_type,
+            mod_name=manifest.name,
+            mod_guid=manifest.guid,
+            location=loc_label,
+            detail=f"批量添加 v{manifest.version} → {dest_file}",
+        )
+        self.session.commit()
+
+        logger.debug("批量安装 - 成功: {} v{}", manifest.name, manifest.version)
+        return BatchItemResult(
+            file_path=fp,
+            status=BatchItemStatus.SUCCESS,
+            message=f"成功：{manifest.name} v{manifest.version}",
+            manifest=manifest,
+        )
 
     # ═══════════════════════════════════════════════════════════
     # 内部方法

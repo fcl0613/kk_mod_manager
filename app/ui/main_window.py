@@ -96,6 +96,7 @@ class MainWindow(QMainWindow):
         self.card_page.install_mod_requested.connect(self._on_card_page_install)
         self.card_page.reparse_requested.connect(self._on_card_page_reparse)
         self.card_page.card_dropped.connect(self._parse_card)
+        self.card_page.convert_to_kk_requested.connect(self._on_convert_to_kk)
         self.page_stack.addWidget(self.card_page)
 
         main_layout.addWidget(self.page_stack, 1)
@@ -414,6 +415,28 @@ class MainWindow(QMainWindow):
         new_result = self.reparse_card()
         if new_result:
             self.card_page.set_card_result(new_result)
+
+    def _on_convert_to_kk(self, input_path: Path, output_path: Path):
+        """卡片解析页：将二代卡（KKS）转换为一代卡（KK）"""
+        logger.info("开始转换卡片: {} → {}", input_path, output_path)
+        self.status_bar.showMessage("正在转换卡片为一代卡（KK）...")
+
+        success, error_msg = self._card_service.kks_to_kk(input_path, output_path)
+
+        if success:
+            self.status_bar.showMessage(f"转换成功：{output_path.name}")
+            QMessageBox.information(
+                self,
+                "转换成功",
+                f"已成功转换为一代卡（KK）：\n{output_path}",
+            )
+        else:
+            self.status_bar.showMessage("转换失败")
+            QMessageBox.warning(
+                self,
+                "转换失败",
+                error_msg,
+            )
 
     # ═══════════════════════════════════════════════════════
     # Mod 安装/添加

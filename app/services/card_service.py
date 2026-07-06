@@ -83,6 +83,12 @@ class CardModItem:
         return texts[self.status]
 
 
+class GameVersion(Enum):
+    """游戏版本"""
+    KK = "kk"      # 一代卡（Koikatu）
+    KKS = "kks"    # 二代卡（Koikatsu Sunshine）
+
+
 @dataclass
 class CardParseResult:
     """卡片解析结果"""
@@ -91,6 +97,7 @@ class CardParseResult:
     card_type: str  # "角色卡" / "服装卡" / "unknown"
     is_valid: bool  # 是否有效卡片
     error_message: str = ""  # 错误信息
+    game_version: GameVersion | None = None  # 游戏版本（KK / KKS）
     mods: list[CardModItem] = field(default_factory=list)
 
     @property
@@ -112,6 +119,79 @@ class CardParseResult:
 
 class CardService:
     """卡片解析服务"""
+
+    # 一代卡（KK）的 Parameter version
+    KK_PARAMETER_VERSION = '0.0.5'
+    # 二代卡（KKS）的 Parameter version
+    KKS_PARAMETER_VERSION = '0.0.6'
+
+    @staticmethod
+    def is_kk_card(card_path: Path) -> bool:
+        """
+        判断卡片是一代卡（KK）还是二代卡（KKS）。
+
+        判断逻辑：通过 KoikatuCharaData 读取 Parameter.version，
+        - version == '0.0.5' → 一代卡（KK）
+        - version == '0.0.6' → 二代卡（KKS）
+
+        Args:
+            card_path: 卡片 PNG 文件路径
+
+        Returns:
+            True 表示一代卡（KK），False 表示二代卡（KKS）
+        """
+        try:
+            kc = KoikatuCharaData.load(str(card_path))
+            version = kc["Parameter"]["version"]
+            return version == '0.0.5'
+        except Exception:
+            return False
+
+    @staticmethod
+    def get_game_version(card_path: Path) -> "GameVersion":
+        """
+        获取卡片的游戏版本。
+
+        Args:
+            card_path: 卡片 PNG 文件路径
+
+        Returns:
+            GameVersion.KK 或 GameVersion.KKS
+        """
+        try:
+            kc = KoikatuCharaData.load(str(card_path))
+            version = kc["Parameter"]["version"]
+            if version == '0.0.5':
+                return GameVersion.KK
+            else:
+                return GameVersion.KKS
+        except Exception:
+            return GameVersion.KKS
+
+    @staticmethod
+    def kks_to_kk(input_path: Path, output_path: Path) -> tuple[bool, str]:
+        """
+        将二代卡（KKS）转换为一代卡（KK）。
+
+        转换方法：
+          1. 使用 kkloader 加载卡片数据
+          2. 将 Parameter.version 从 '0.0.6' 修改为 '0.0.5'
+          3. 保存到指定输出路径
+
+        Args:
+            input_path: 输入的二代卡文件路径
+            output_path: 输出的一代卡文件路径
+
+        Returns:
+            (成功与否, 错误信息)
+        """
+        try:
+            kc = KoikatuCharaData.load(str(input_path))
+            kc["Parameter"]["version"] = '0.0.5'
+            kc.save(str(output_path))
+            return True, ""
+        except Exception as e:
+            return False, f"转换失败：{e}"
 
     def parse_card(self, card_path: Path) -> CardParseResult:
         """
@@ -192,6 +272,9 @@ class CardService:
                 guids = self.parse_character_card(path)
                 logger.debug("解析角色卡: {} → {} 个 GUID", path.name, len(guids))
 
+            # 判断游戏版本（KK / KKS）
+            game_version = self.get_game_version(path)
+
             # 对每个 GUID 做 strip 清洗
             guids = {g.strip(" !$'\"") for g in guids if g.strip(" !$'\"")}
 
@@ -203,6 +286,7 @@ class CardService:
                     card_type=card_type,
                     is_valid=True,
                     error_message="",
+                    game_version=game_version,
                     mods=[],
                 )
 
@@ -213,6 +297,7 @@ class CardService:
                 card_type=card_type,
                 is_valid=True,
                 error_message="",
+                game_version=game_version,
                 mods=[CardModItem(guid=g, status=CardModStatus.MISSING) for g in sorted(guids)],
             )
 

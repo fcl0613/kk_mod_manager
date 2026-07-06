@@ -20,7 +20,7 @@ from loguru import logger
 from app.services.card_service import (
     CardParseResult,
     CardModStatus,
-    CardModItem,
+    GameVersion,
 )
 
 
@@ -33,6 +33,8 @@ class CardParsePage(QWidget):
     reparse_requested = pyqtSignal()
     # 信号：新卡片拖入/选择，请求解析
     card_dropped = pyqtSignal(Path)
+    # 信号：请求将二代卡转换为一代卡（输入路径, 输出路径）
+    convert_to_kk_requested = pyqtSignal(Path, Path)
 
     INSTALLED_COLOR = "#a6e3a1"
     IN_REPO_COLOR = "#f9e2af"
@@ -116,6 +118,20 @@ class CardParsePage(QWidget):
         self.card_type_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.card_type_label.setObjectName("cardTypeLabel")
         left_panel.addWidget(self.card_type_label)
+
+        # 游戏版本标签
+        self.game_version_label = QLabel("")
+        self.game_version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.game_version_label.setObjectName("cardTypeLabel")
+        left_panel.addWidget(self.game_version_label)
+
+        # 转为 KK 卡按钮（仅二代卡显示）
+        self.convert_to_kk_btn = QPushButton("转为 KK 卡")
+        self.convert_to_kk_btn.setObjectName("primary")
+        self.convert_to_kk_btn.setFixedHeight(30)
+        self.convert_to_kk_btn.setVisible(False)
+        self.convert_to_kk_btn.clicked.connect(self._on_convert_to_kk)
+        left_panel.addWidget(self.convert_to_kk_btn)
 
         left_widget = QFrame()
         left_widget.setLayout(left_panel)
@@ -275,6 +291,8 @@ class CardParsePage(QWidget):
         self.image_label.setText("暂无卡片")
         self.card_name_label.setText("")
         self.card_type_label.setText("")
+        self.game_version_label.setText("")
+        self.convert_to_kk_btn.setVisible(False)
         self.stats_label.setText("拖入 PNG 卡片开始解析")
         self.install_all_btn.setVisible(False)
         self.copy_missing_btn.setVisible(False)
@@ -304,6 +322,17 @@ class CardParsePage(QWidget):
 
         # 卡片类型
         self.card_type_label.setText(f"类型：{self._result.card_type}")
+
+        # 游戏版本
+        if self._result.game_version == GameVersion.KK:
+            self.game_version_label.setText("游戏：KK")
+            self.convert_to_kk_btn.setVisible(False)
+        elif self._result.game_version == GameVersion.KKS:
+            self.game_version_label.setText("游戏：KKS")
+            self.convert_to_kk_btn.setVisible(True)
+        else:
+            self.game_version_label.setText("")
+            self.convert_to_kk_btn.setVisible(False)
 
         if not self._result.is_valid:
             self.stats_label.setText(f"⚠ {self._result.error_message}")
@@ -466,6 +495,30 @@ class CardParsePage(QWidget):
             self,
             "已复制",
             f"已复制 {len(missing)} 个缺失 Mod 的 GUID 到剪贴板",
+        )
+
+    def _on_convert_to_kk(self):
+        """转为 KK 卡按钮 — 弹出文件保存对话框，发射信号给 MainWindow 处理"""
+        if self._result is None:
+            return
+
+        # 默认文件名：原文件名加 _kk 后缀
+        original_name = self._result.card_path.stem
+        default_name = f"{original_name}_kk.png"
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存为一代卡（KK）",
+            str(self._result.card_path.parent / default_name),
+            "PNG 文件 (*.png);;所有文件 (*.*)",
+        )
+        if not save_path:
+            return
+
+        logger.info("用户选择保存路径: {}", save_path)
+        self.convert_to_kk_requested.emit(
+            self._result.card_path,
+            Path(save_path),
         )
 
     def _update_stats(self):

@@ -5,3 +5,7 @@
 /logs
 /build
 /dist
+
+__pycache__
+
+data

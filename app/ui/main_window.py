@@ -421,7 +421,7 @@ class MainWindow(QMainWindow):
         logger.info("开始转换卡片: {} → {}", input_path, output_path)
         self.status_bar.showMessage("正在转换卡片为一代卡（KK）...")
 
-        success, error_msg = self._card_service.kks_to_kk(input_path, output_path)
+        success, error_msg = self._card_service.kks_to_kk(output_path)
 
         if success:
             self.status_bar.showMessage(f"转换成功：{output_path.name}")

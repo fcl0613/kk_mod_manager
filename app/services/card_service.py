@@ -85,8 +85,8 @@ class CardModItem:
 
 class GameVersion(Enum):
     """游戏版本"""
-    KK = "kk"      # 一代卡（Koikatu）
-    KKS = "kks"    # 二代卡（Koikatsu Sunshine）
+    KK = "kk"  # 一代卡（Koikatu）
+    KKS = "kks"  # 二代卡（Koikatsu Sunshine）
 
 
 @dataclass
@@ -125,41 +125,20 @@ class CardService:
     # 二代卡（KKS）的 Parameter version
     KKS_PARAMETER_VERSION = '0.0.6'
 
-    @staticmethod
-    def is_kk_card(card_path: Path) -> bool:
-        """
-        判断卡片是一代卡（KK）还是二代卡（KKS）。
-
-        判断逻辑：通过 KoikatuCharaData 读取 Parameter.version，
-        - version == '0.0.5' → 一代卡（KK）
-        - version == '0.0.6' → 二代卡（KKS）
-
-        Args:
-            card_path: 卡片 PNG 文件路径
-
-        Returns:
-            True 表示一代卡（KK），False 表示二代卡（KKS）
-        """
-        try:
-            kc = KoikatuCharaData.load(str(card_path))
-            version = kc["Parameter"]["version"]
-            return version == '0.0.5'
-        except Exception:
-            return False
+    kc: KoikatuCharaData | None
 
     @staticmethod
-    def get_game_version(card_path: Path) -> "GameVersion":
+    def get_game_version(kc: KoikatuCharaData) -> "GameVersion":
         """
         获取卡片的游戏版本。
 
         Args:
-            card_path: 卡片 PNG 文件路径
+            kc: KoikatuCharaData
 
         Returns:
             GameVersion.KK 或 GameVersion.KKS
         """
         try:
-            kc = KoikatuCharaData.load(str(card_path))
             version = kc["Parameter"]["version"]
             if version == '0.0.5':
                 return GameVersion.KK
@@ -168,8 +147,7 @@ class CardService:
         except Exception:
             return GameVersion.KKS
 
-    @staticmethod
-    def kks_to_kk(input_path: Path, output_path: Path) -> tuple[bool, str]:
+    def kks_to_kk(self, output_path: Path) -> tuple[bool, str]:
         """
         将二代卡（KKS）转换为一代卡（KK）。
 
@@ -179,16 +157,18 @@ class CardService:
           3. 保存到指定输出路径
 
         Args:
-            input_path: 输入的二代卡文件路径
             output_path: 输出的一代卡文件路径
 
         Returns:
             (成功与否, 错误信息)
         """
+        if self.kc is None:
+            return False, "转换失败"
         try:
-            kc = KoikatuCharaData.load(str(input_path))
-            kc["Parameter"]["version"] = '0.0.5'
-            kc.save(str(output_path))
+            self.kc["Parameter"]["version"] = '0.0.5'
+            self.kc.Parameter.version = '0.0.5'
+            self.kc.header = b'\xe3\x80\x90KoiKatuChara\xe3\x80\x91'
+            self.kc.save(str(output_path))
             return True, ""
         except Exception as e:
             return False, f"转换失败：{e}"
@@ -266,14 +246,18 @@ class CardService:
             if is_cloth:
                 card_type = "服装卡"
                 guids = self.parse_cloth_card(path)
+                # 服装卡目前只支持kk
+                game_version = GameVersion.KK
+                self.kc = None
                 logger.debug("解析服装卡: {} → {} 个 GUID", path.name, len(guids))
             else:
                 card_type = "角色卡"
-                guids = self.parse_character_card(path)
+                kc = KoikatuCharaData.load(str(path))
+                self.kc = kc
+                guids = self.parse_character_card(kc)
+                # 角色卡才需要判断游戏版本（KK / KKS）
+                game_version = self.get_game_version(kc)
                 logger.debug("解析角色卡: {} → {} 个 GUID", path.name, len(guids))
-
-            # 判断游戏版本（KK / KKS）
-            game_version = self.get_game_version(path)
 
             # 对每个 GUID 做 strip 清洗
             guids = {g.strip(" !$'\"") for g in guids if g.strip(" !$'\"")}
@@ -404,7 +388,7 @@ class CardService:
         return None
 
     @staticmethod
-    def parse_character_card(file_path: Path) -> set[str]:
+    def parse_character_card(kc: KoikatuCharaData) -> set[str]:
         """
         解析角色卡 PNG 文件，通过 kkloader 提取 sideloader 依赖的 Mod GUID。
 
@@ -413,14 +397,13 @@ class CardService:
         角色所依赖的 Mod GUID。
 
         Args:
-            file_path: PNG 角色卡文件路径
+            kc: KoikatuCharaData
 
         Returns:
             GUID 集合（可能为空）
         """
         mod_ids: set[str] = set()
         try:
-            kc = KoikatuCharaData.load(str(file_path))
             resolver = kc['KKEx']['com.bepis.sideloader.universalautoresolver']
             info_list: list[bytes] = resolver[1]['info']
             start = 8

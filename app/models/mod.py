@@ -74,6 +74,9 @@ class Mod(Base):
     # ── 用户备注 ──
     notes: Mapped[str] = mapped_column(String(1000), default="")
 
+    # —— 仓库mod相对路径 ——
+    repo_relative_path: Mapped[str] = mapped_column(String(1000), default="", comment="仓库mod的相对路径")
+
     # ── 复合索引：同一位置下 GUID 唯一 ──
     __table_args__ = (
         Index("idx_location_guid", "location", "guid", unique=True),
@@ -114,6 +117,7 @@ class Mod(Base):
             "status": self.status.value,
             "installed_at": self.installed_at.isoformat() if self.installed_at else None,
             "notes": self.notes,
+            "repo_relative_path": self.repo_relative_path
         }
 
 

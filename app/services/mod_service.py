@@ -36,6 +36,8 @@ from app.utils.file_utils import (
     rename_extension,
     clean_empty_dirs,
     get_author_dir,
+    compute_repo_relative_path,
+    resolve_repo_mod_path,
 )
 
 
@@ -361,6 +363,7 @@ class ModService:
             location=ModLocation.REPO,
             status=ModStatus.ENABLED,
             installed_at=datetime.now(),
+            repo_relative_path=compute_repo_relative_path(repo_root, dest_file),
         )
         self.session.add(mod)
 
@@ -431,14 +434,19 @@ class ModService:
             return InstallResult(success=False, message=f"Mod 不存在：ID={mod_id}")
 
         config = get_config()
-        base_path = (
-            config.game_mod_path if mod.location == ModLocation.GAME
-            else config.repo_path
-        )
 
         # 删除文件
-        author_dir = get_author_dir(Path(base_path), mod.author)
-        file_path = author_dir / mod.current_file_name
+        if mod.location == ModLocation.GAME:
+            # GAME 端保持原状
+            base_path = config.game_mod_path
+            author_dir = get_author_dir(Path(base_path), mod.author)
+            file_path = author_dir / mod.current_file_name
+        else:
+            # REPO 端优先用 repo_relative_path
+            base_path = config.repo_path
+            file_path = resolve_repo_mod_path(mod, Path(base_path))
+            # REPO 端也需要 author_dir 用于清理空目录
+            author_dir = get_author_dir(Path(base_path), mod.author)
 
         if file_path.exists():
             try:
@@ -602,8 +610,7 @@ class ModService:
         # 从仓库复制到游戏
         repo_path = Path(config.repo_path)
         game_path = Path(config.game_mod_path)
-        author_dir = get_author_dir(repo_path, repo_mod.author)
-        src_file = author_dir / repo_mod.current_file_name
+        src_file = resolve_repo_mod_path(repo_mod, repo_path)
 
         if not src_file.exists():
             logger.error("从仓库安装失败 - 仓库文件不存在: {}", src_file)
@@ -754,6 +761,7 @@ class ModService:
             location=ModLocation.REPO,
             status=ModStatus.ENABLED,
             installed_at=datetime.now(),
+            repo_relative_path=compute_repo_relative_path(repo_path, dest_file),
         )
         self.session.add(repo_mod)
 
@@ -909,6 +917,10 @@ class ModService:
                 status=ModStatus.ENABLED,
                 installed_at=datetime.fromtimestamp(
                     zipmod_file.stat().st_mtime
+                ),
+                repo_relative_path=(
+                    zipmod_file.relative_to(base_path).as_posix()
+                    if location == ModLocation.REPO else ""
                 ),
             )
             self.session.add(mod)
@@ -1121,6 +1133,10 @@ class ModService:
             location=location,
             status=ModStatus.ENABLED,
             installed_at=datetime.now(),
+            repo_relative_path=(
+                compute_repo_relative_path(base_path, dest_file)
+                if location == ModLocation.REPO else ""
+            ),
         )
         self.session.add(mod)
 
@@ -1150,8 +1166,14 @@ class ModService:
     @staticmethod
     def _remove_mod_files(mod: Mod, base_path: str) -> None:
         """删除 Mod 对应的磁盘文件"""
-        author_dir = get_author_dir(Path(base_path), mod.author)
-        file_path = author_dir / mod.current_file_name
+        base = Path(base_path)
+        if mod.location == ModLocation.REPO and mod.repo_relative_path:
+            # REPO 端优先用精确路径
+            file_path = base / mod.repo_relative_path
+        else:
+            # GAME 端 或 老数据回退
+            author_dir = get_author_dir(base, mod.author)
+            file_path = author_dir / mod.current_file_name
         if file_path.exists():
             delete_file(file_path)
 

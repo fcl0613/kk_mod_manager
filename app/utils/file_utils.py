@@ -177,3 +177,36 @@ def get_author_dir(base_path: Path, author: str) -> Path:
 
     # 不存在 → 使用规范化作者名
     return base_path / display_name
+
+
+def compute_repo_relative_path(repo_root: Path, file_path: Path) -> str:
+    """计算仓库 Mod 文件相对于仓库根的相对路径（POSIX 风格）。
+
+    Args:
+        repo_root: 仓库根目录
+        file_path: Mod 文件的绝对路径
+
+    Returns:
+        相对于 repo_root 的 POSIX 风格相对路径，如 "Makise/[Makise]GS-Alice.zipmod"
+    """
+    return Path(file_path).resolve().relative_to(Path(repo_root).resolve()).as_posix()
+
+
+def resolve_repo_mod_path(mod, repo_root: Path) -> Path:
+    """解析仓库 Mod 的磁盘绝对路径。
+
+    优先使用 mod.repo_relative_path；为空时回退到旧的"作者目录/文件名"公式。
+
+    Args:
+        mod: Mod 实例
+        repo_root: 仓库根目录
+
+    Returns:
+        Mod 文件的绝对路径
+    """
+    repo_root = Path(repo_root)
+    if mod.repo_relative_path:
+        return repo_root / mod.repo_relative_path
+    # 回退：兼容老数据（迁移前 + 找不到文件的孤儿记录）
+    author_dir = get_author_dir(repo_root, mod.author)
+    return author_dir / mod.current_file_name

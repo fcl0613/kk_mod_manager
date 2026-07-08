@@ -889,6 +889,7 @@ class ModService:
         self.session.flush()
 
         count = 0
+        seen_guids: set[str] = set()
         for zipmod_file in base_path.rglob("*.zipmod"):
             if not zipmod_file.is_file():
                 continue
@@ -896,6 +897,11 @@ class ModService:
                 manifest = self.manifest_svc.parse_from_zipmod(zipmod_file)
             except ManifestParseError:
                 continue
+
+            # 同一位置下按 GUID 去重（避免硬链接导致重复扫描）
+            if manifest.guid in seen_guids:
+                continue
+            seen_guids.add(manifest.guid)
 
             # 检查 author 目录
             parent_dir = zipmod_file.parent

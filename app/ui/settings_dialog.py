@@ -16,7 +16,9 @@ from PyQt6.QtWidgets import (
 )
 
 from app.config import get_config, save_config
-from app.database import get_db_path, init_db
+from app.database import get_db_path, get_session, init_db
+from app.models.mod import Mod, ModLocation, OperationLog
+from app.services.mod_service import ModService
 
 
 class SettingsDialog(QDialog):
@@ -174,11 +176,32 @@ class SettingsDialog(QDialog):
 
         if reply == QMessageBox.StandardButton.Yes:
             try:
+                # 1. 重新创建表结构
                 init_db()
+
+                # 2. 获取数据库 Session
+                session = get_session()
+                mod_svc = ModService(session)
+
+                # 3. 删除所有 Mod 和操作日志数据
+                session.query(OperationLog).delete()
+                session.query(Mod).delete()
+                session.commit()
+
+                # 4. 从仓库路径扫描 Mod 并入库
+                repo_count = mod_svc.refresh_from_disk(ModLocation.REPO)
+
+                # 5. 从游戏路径扫描 Mod 并入库
+                game_count = mod_svc.refresh_from_disk(ModLocation.GAME)
+
+                session.close()
+
                 QMessageBox.information(
                     self,
                     "成功",
-                    "数据库初始化成功！",
+                    f"数据库初始化成功！\n"
+                    f"游戏 Mod：{game_count} 个\n"
+                    f"仓库 Mod：{repo_count} 个",
                     QMessageBox.StandardButton.Ok
                 )
             except Exception as e:

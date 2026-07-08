@@ -813,7 +813,8 @@ class MainWindow(QMainWindow):
                 "欢迎使用 KK Mod Manager",
                 "首次使用请先配置以下路径：\n\n"
                 "1. 游戏 Mod 路径（Sideloader Mods 目录）\n"
-                "2. 本地 Mod 仓库路径（Mod 收藏目录）\n\n"
+                "2. 本地 Mod 仓库路径（Mod 收藏目录）\n"
+                "3. 点击保存后再次打开设置即可初始化mod数据库信息\n\n"
                 "点击「设置」按钮开始配置。",
             ))
 

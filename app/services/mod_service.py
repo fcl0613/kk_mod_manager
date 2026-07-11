@@ -789,8 +789,21 @@ class ModService:
         self,
         location: ModLocation,
         search: str = "",
+        limit: int | None = None,
+        offset: int | None = None,
     ) -> list[Mod]:
-        """查询指定位置的 Mod 列表"""
+        """
+        查询指定位置的 Mod 列表（支持分页）。
+
+        Args:
+            location: Mod 位置
+            search: 搜索关键字
+            limit: 每页数量，None 表示不限制（全部返回）
+            offset: 跳过数量
+
+        Returns:
+            Mod 列表
+        """
         query = self.session.query(Mod).filter(Mod.location == location)
 
         if search:
@@ -802,7 +815,31 @@ class ModService:
             )
 
         query = query.order_by(Mod.author_normalized, Mod.name)
+
+        if limit is not None:
+            query = query.limit(limit)
+        if offset is not None:
+            query = query.offset(offset)
+
         return query.all()
+
+    def get_mods_count(
+        self,
+        location: ModLocation,
+        search: str = "",
+    ) -> int:
+        """获取指定位置 Mod 总数（用于分页）"""
+        query = self.session.query(Mod).filter(Mod.location == location)
+
+        if search:
+            pattern = f"%{search}%"
+            query = query.filter(
+                (Mod.name.like(pattern))
+                | (Mod.author.like(pattern))
+                | (Mod.guid.like(pattern))
+            )
+
+        return query.count()
 
     def get_mod_by_id(self, mod_id: int) -> Mod | None:
         """根据 ID 获取 Mod"""
@@ -861,6 +898,40 @@ class ModService:
                 result[key] = []
             result[key].append(mod)
         return result
+
+    def group_by_author_paginated(
+        self,
+        location: ModLocation,
+        search: str = "",
+        page: int = 1,
+        page_size: int = 100,
+    ) -> tuple[dict[str, list[Mod]], int]:
+        """
+        按作者分组 Mod 列表（支持分页）。
+
+        先按 author 分组，再对每个组的 Mod 数量求和得到总数。
+        分页作用于最外层的 Mod 列表。
+
+        Args:
+            location: Mod 位置
+            search: 搜索关键字
+            page: 页码（从 1 开始）
+            page_size: 每页 Mod 数量
+
+        Returns:
+            (grouped_mods, total_count) 元组
+        """
+        total = self.get_mods_count(location, search)
+        offset = (page - 1) * page_size
+        mods = self.get_mods_by_location(location, search, limit=page_size, offset=offset)
+
+        result: dict[str, list[Mod]] = {}
+        for mod in mods:
+            key = mod.author.strip() if mod.author else "Unknown"
+            if key not in result:
+                result[key] = []
+            result[key].append(mod)
+        return result, total
 
     def refresh_from_disk(
         self,

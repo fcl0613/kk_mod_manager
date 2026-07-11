@@ -11,7 +11,7 @@
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout,
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QPushButton, QLineEdit, QLabel,
     QTreeWidget, QTreeWidgetItem, QSplitter,
     QTabWidget, QTabBar, QStackedWidget,
@@ -43,6 +43,13 @@ class MainWindow(QMainWindow):
         self._card_result: CardParseResult | None = None  # 最近一次卡片解析结果
         self._pending_path: Path | None = None  # 等待重试的原始文件路径
         self._pending_location: ModLocation | None = None  # 等待重试的目标位置
+
+        # 分页状态
+        self._page_size = 200  # 每页默认 200 个 Mod
+        self._game_page = 1
+        self._repo_page = 1
+        self._game_total = 0
+        self._repo_total = 0
 
         # 初始化数据库
         init_db()
@@ -229,7 +236,42 @@ class MainWindow(QMainWindow):
         self.tab_widget.currentChanged.connect(self._on_mod_tab_changed)
         layout.addWidget(self.tab_widget)
 
+        # 分页导航栏
+        self._create_pagination_bar(layout)
+
         return panel
+
+    def _create_pagination_bar(self, parent_layout: QVBoxLayout):
+        """创建分页导航栏"""
+        pagination_widget = QWidget()
+        pagination_layout = QHBoxLayout(pagination_widget)
+        pagination_layout.setContentsMargins(4, 2, 4, 2)
+        pagination_layout.setSpacing(8)
+
+        # 上一页按钮
+        self.prev_page_btn = QPushButton("◀ 上一页")
+        self.prev_page_btn.setFixedWidth(80)
+        self.prev_page_btn.clicked.connect(self._on_prev_page)
+        pagination_layout.addWidget(self.prev_page_btn)
+
+        # 页码信息
+        self.page_label = QLabel("第 1 / 1 页")
+        self.page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.page_label.setMinimumWidth(100)
+        pagination_layout.addWidget(self.page_label)
+
+        # 下一页按钮
+        self.next_page_btn = QPushButton("下一页 ▶")
+        self.next_page_btn.setFixedWidth(80)
+        self.next_page_btn.clicked.connect(self._on_next_page)
+        pagination_layout.addWidget(self.next_page_btn)
+
+        # 分页大小选择
+        pagination_layout.addWidget(QLabel("每页:"))
+        self.page_size_combo = QLabel(str(self._page_size))
+        pagination_layout.addWidget(self.page_size_combo)
+
+        parent_layout.addWidget(pagination_widget)
 
     def _create_mod_tree(self) -> QTreeWidget:
         """创建 Mod 列表树"""
@@ -680,15 +722,44 @@ class MainWindow(QMainWindow):
         else:
             self._refresh_repo_list()
 
+    def _on_prev_page(self):
+        """上一页"""
+        idx = self.tab_widget.currentIndex()
+        if idx == 0:
+            if self._game_page > 1:
+                self._game_page -= 1
+                self._refresh_game_list()
+        else:
+            if self._repo_page > 1:
+                self._repo_page -= 1
+                self._refresh_repo_list()
+
+    def _on_next_page(self):
+        """下一页"""
+        idx = self.tab_widget.currentIndex()
+        if idx == 0:
+            total_pages = max(1, (self._game_total + self._page_size - 1) // self._page_size)
+            if self._game_page < total_pages:
+                self._game_page += 1
+                self._refresh_game_list()
+        else:
+            total_pages = max(1, (self._repo_total + self._page_size - 1) // self._page_size)
+            if self._repo_page < total_pages:
+                self._repo_page += 1
+                self._refresh_repo_list()
+
     def _refresh_game_list(self):
         """刷新游戏 Mod 列表"""
         self.game_tree.clear()
         search = self.search_edit.text().strip()
 
-        grouped = self._mod_service.group_by_author(ModLocation.GAME, search)
-        stats = self._mod_service.get_statistics(ModLocation.GAME)
+        grouped, total = self._mod_service.group_by_author_paginated(
+            ModLocation.GAME, search, page=self._game_page, page_size=self._page_size
+        )
+        self._game_total = total
 
         self._populate_tree(self.game_tree, grouped)
+        self._update_pagination_label()
         self._update_status_bar()
 
     def _refresh_repo_list(self):
@@ -696,11 +767,30 @@ class MainWindow(QMainWindow):
         self.repo_tree.clear()
         search = self.search_edit.text().strip()
 
-        grouped = self._mod_service.group_by_author(ModLocation.REPO, search)
-        stats = self._mod_service.get_statistics(ModLocation.REPO)
+        grouped, total = self._mod_service.group_by_author_paginated(
+            ModLocation.REPO, search, page=self._repo_page, page_size=self._page_size
+        )
+        self._repo_total = total
 
         self._populate_tree(self.repo_tree, grouped)
+        self._update_pagination_label()
         self._update_status_bar()
+
+    def _update_pagination_label(self):
+        """更新分页标签"""
+        idx = self.tab_widget.currentIndex()
+        if idx == 0:
+            current = self._game_page
+            total = self._game_total
+        else:
+            current = self._repo_page
+            total = self._repo_total
+
+        total_pages = max(1, (total + self._page_size - 1) // self._page_size)
+        self.page_label.setText(f"第 {current} / {total_pages} 页 (共 {total} 个)")
+
+        self.prev_page_btn.setEnabled(current > 1)
+        self.next_page_btn.setEnabled(current < total_pages)
 
     def _populate_tree(
         self,
@@ -745,10 +835,18 @@ class MainWindow(QMainWindow):
 
     def _on_mod_tab_changed(self, index: int):
         """Mod 管理页内部的 Tab 切换（游戏/仓库）"""
+        # 重置到第一页
+        if index == 0:
+            self._game_page = 1
+        else:
+            self._repo_page = 1
         self._refresh_current()
         self.detail_panel.clear()
 
     def _on_search(self, text: str):
+        # 搜索时重置到第一页
+        self._game_page = 1
+        self._repo_page = 1
         self._refresh_current()
 
     def _on_mod_selected(self, item: QTreeWidgetItem, column: int):

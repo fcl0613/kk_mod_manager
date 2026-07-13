@@ -15,15 +15,15 @@ from PyQt6.QtWidgets import (
     QToolBar, QPushButton, QLineEdit, QLabel,
     QTreeWidget, QTreeWidgetItem, QSplitter,
     QTabWidget, QTabBar, QStackedWidget,
-    QStatusBar, QFileDialog, QMessageBox,
+    QStatusBar, QFileDialog, QMessageBox, QProgressDialog,
 )
 from PyQt6.QtCore import Qt, QSize, QTimer
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
 from loguru import logger
 
 from app.config import get_config, save_config, reload_config
-from app.database import init_db, get_session
-from app.models.mod import Mod, ModLocation, ModStatus
+from app.database import init_db, get_session, get_db_path
+from app.models.mod import Mod, ModLocation, ModStatus, OperationLog
 from app.services.mod_service import ModService, InstallResult
 from app.services.card_service import CardService, CardParseResult
 from app.ui.settings_dialog import SettingsDialog
@@ -216,6 +216,11 @@ class MainWindow(QMainWindow):
         settings_btn = QPushButton("⚙ 设置")
         settings_btn.clicked.connect(self._open_settings)
         toolbar.addWidget(settings_btn)
+
+        # 初始化MOD按钮
+        init_mod_btn = QPushButton("🔄 初始化MOD")
+        init_mod_btn.clicked.connect(self._init_mod)
+        toolbar.addWidget(init_mod_btn)
 
     def _create_left_panel(self) -> QWidget:
         """创建左侧面板（Tab 切换游戏/仓库的 Mod 列表）"""
@@ -887,6 +892,93 @@ class MainWindow(QMainWindow):
             self._load_theme()
             self._refresh_current()
             self.status_bar.showMessage("设置已保存")
+
+    def _init_mod(self):
+        """初始化 MOD 数据库"""
+        db_path = get_db_path()
+        is_first_init = not db_path.exists()
+
+        if is_first_init:
+            reply = QMessageBox.question(
+                self,
+                "初始化数据库",
+                "确定要初始化数据库吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+        else:
+            reply = QMessageBox.warning(
+                self,
+                "重置数据库",
+                "此操作会重置mod数据库是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                progress = QProgressDialog("正在初始化数据库...", "取消", 0, 5, self)
+                progress.setWindowTitle("请稍候")
+                progress.setModal(True)
+                progress.setMinimumDuration(0)
+                progress.setValue(0)
+                progress.show()
+
+                progress.setLabelText("正在创建表结构...")
+                progress.setValue(1)
+                if progress.wasCanceled():
+                    return
+                init_db()
+
+                progress.setLabelText("正在连接数据库...")
+                progress.setValue(2)
+                if progress.wasCanceled():
+                    return
+                session = get_session()
+                mod_svc = ModService(session)
+
+                progress.setLabelText("正在清理旧数据...")
+                progress.setValue(3)
+                if progress.wasCanceled():
+                    session.close()
+                    return
+                session.query(OperationLog).delete()
+                session.query(Mod).delete()
+                session.commit()
+
+                progress.setLabelText("正在扫描仓库 Mod...")
+                progress.setValue(4)
+                if progress.wasCanceled():
+                    session.close()
+                    return
+                repo_count = mod_svc.refresh_from_disk(ModLocation.REPO)
+
+                progress.setLabelText("正在扫描游戏 Mod...")
+                progress.setValue(5)
+                if progress.wasCanceled():
+                    session.close()
+                    return
+                game_count = mod_svc.refresh_from_disk(ModLocation.GAME)
+
+                session.close()
+                progress.close()
+
+                QMessageBox.information(
+                    self,
+                    "成功",
+                    f"数据库初始化成功！\n"
+                    f"游戏 Mod：{game_count} 个\n"
+                    f"仓库 Mod：{repo_count} 个",
+                    QMessageBox.StandardButton.Ok
+                )
+                self._refresh_current()
+            except Exception as e:
+                QMessageBox.critical(
+                    self,
+                    "错误",
+                    f"数据库初始化失败：{str(e)}",
+                    QMessageBox.StandardButton.Ok
+                )
 
     def _load_theme(self):
         """加载主题样式"""

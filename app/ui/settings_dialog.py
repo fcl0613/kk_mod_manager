@@ -12,13 +12,10 @@ from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton, QCheckBox, QComboBox,
-    QGroupBox, QFormLayout, QFileDialog, QMessageBox,
+    QGroupBox, QFormLayout, QFileDialog
 )
 
 from app.config import get_config, save_config
-from app.database import get_db_path, get_session, init_db
-from app.models.mod import Mod, ModLocation, OperationLog
-from app.services.mod_service import ModService
 
 
 class SettingsDialog(QDialog):
@@ -95,19 +92,6 @@ class SettingsDialog(QDialog):
         theme_form.addRow("主题:", self.theme_combo)
         layout.addWidget(theme_group)
 
-        # ── 数据库管理 ──
-        db_group = QGroupBox("MOD数据库管理")
-        db_layout = QVBoxLayout(db_group)
-
-        db_btn_layout = QHBoxLayout()
-        self.init_db_btn = QPushButton("初始化仓库和游戏MOD数据")
-        self.init_db_btn.clicked.connect(self._init_database)
-        db_btn_layout.addWidget(self.init_db_btn)
-        db_btn_layout.addStretch()
-        db_layout.addLayout(db_btn_layout)
-
-        layout.addWidget(db_group)
-
         # ── 按钮 ──
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
@@ -149,68 +133,6 @@ class SettingsDialog(QDialog):
         )
         if path:
             self.repo_path_edit.setText(path)
-
-    def _init_database(self):
-        """初始化数据库"""
-        db_path = get_db_path()
-        is_first_init = not db_path.exists()
-
-        if is_first_init:
-            # 第一次初始化，弹出确认对话框
-            reply = QMessageBox.question(
-                self,
-                "初始化数据库",
-                "确定要初始化数据库吗？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-            )
-        else:
-            # 非第一次初始化，显示重置提示
-            reply = QMessageBox.warning(
-                self,
-                "重置数据库",
-                "此操作会重置mod数据库是否继续？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-            )
-
-        if reply == QMessageBox.StandardButton.Yes:
-            try:
-                # 1. 重新创建表结构
-                init_db()
-
-                # 2. 获取数据库 Session
-                session = get_session()
-                mod_svc = ModService(session)
-
-                # 3. 删除所有 Mod 和操作日志数据
-                session.query(OperationLog).delete()
-                session.query(Mod).delete()
-                session.commit()
-
-                # 4. 从仓库路径扫描 Mod 并入库
-                repo_count = mod_svc.refresh_from_disk(ModLocation.REPO)
-
-                # 5. 从游戏路径扫描 Mod 并入库
-                game_count = mod_svc.refresh_from_disk(ModLocation.GAME)
-
-                session.close()
-
-                QMessageBox.information(
-                    self,
-                    "成功",
-                    f"数据库初始化成功！\n"
-                    f"游戏 Mod：{game_count} 个\n"
-                    f"仓库 Mod：{repo_count} 个",
-                    QMessageBox.StandardButton.Ok
-                )
-            except Exception as e:
-                QMessageBox.critical(
-                    self,
-                    "错误",
-                    f"数据库初始化失败：{str(e)}",
-                    QMessageBox.StandardButton.Ok
-                )
 
     def _save(self):
         """保存配置"""

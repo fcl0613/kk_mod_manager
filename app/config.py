@@ -39,7 +39,7 @@ class AppConfig(BaseModel):
         default="dark",
         description="界面主题：dark / light"
     )
-    window_width: int = Field(default=1200, description="窗口宽度")
+    window_width: int = Field(default=1350, description="窗口宽度")
     window_height: int = Field(default=800, description="窗口高度")
 
     # ── 行为配置 ──

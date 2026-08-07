@@ -128,14 +128,13 @@ class ModService:
           - OLDER_VERSION: 需要 confirm_downgrade=True
         """
         config = get_config()
-        path = Path(zipmod_path)
 
         # 1. 解析元数据
         try:
-            manifest = self.manifest_svc.parse_from_zipmod(path)
+            manifest = self.manifest_svc.parse_from_zipmod(zipmod_path)
             logger.debug("解析 zipmod 成功: name={} version={} guid={}", manifest.name, manifest.version, manifest.guid)
         except ManifestParseError as e:
-            logger.warning("zipmod 解析失败: {} - {}", path.name, e)
+            logger.warning("zipmod 解析失败: {} - {}", zipmod_path.name, e)
             return InstallResult(success=False, message=str(e))
 
         # 2. 检查游戏路径是否配置
@@ -202,15 +201,15 @@ class ModService:
 
         try:
             dest_file = safe_copy(
-                src=path,
+                src=zipmod_path,
                 dst_dir=author_dir,
                 author=manifest.display_author,
-                file_name=path.name,
+                file_name=zipmod_path.name,
                 version=manifest.version,
             )
-            logger.info("文件复制成功: {} → {}", path.name, dest_file)
+            logger.info("文件复制成功: {} → {}", zipmod_path.name, dest_file)
         except OSError as e:
-            logger.error("文件复制失败: {} → {} - {}", path.name, author_dir, e)
+            logger.error("文件复制失败: {} → {} - {}", zipmod_path.name, author_dir, e)
             return InstallResult(
                 success=False,
                 message=f"文件复制失败：{e}",
@@ -267,14 +266,13 @@ class ModService:
         与 install_to_game 逻辑相同，只是目标路径不同。
         """
         config = get_config()
-        path = Path(zipmod_path)
 
         # 1. 解析
         try:
-            manifest = self.manifest_svc.parse_from_zipmod(path)
+            manifest = self.manifest_svc.parse_from_zipmod(zipmod_path)
             logger.debug("解析 zipmod 成功(add_to_repo): name={} version={}", manifest.name, manifest.version)
         except ManifestParseError as e:
-            logger.warning("zipmod 解析失败(add_to_repo): {} - {}", path.name, e)
+            logger.warning("zipmod 解析失败(add_to_repo): {} - {}", zipmod_path.name, e)
             return InstallResult(success=False, message=str(e))
 
         # 2. 校验仓库路径
@@ -335,15 +333,15 @@ class ModService:
 
         try:
             dest_file = safe_copy(
-                src=path,
+                src=zipmod_path,
                 dst_dir=author_dir,
                 author=manifest.display_author,
-                file_name=path.name,
+                file_name=zipmod_path.name,
                 version=manifest.version,
             )
-            logger.info("添加到仓库成功: {} → {}", path.name, dest_file)
+            logger.info("添加到仓库成功: {} → {}", zipmod_path.name, dest_file)
         except OSError as e:
-            logger.error("添加到仓库文件复制失败: {} - {}", path.name, e)
+            logger.error("添加到仓库文件复制失败: {} - {}", zipmod_path.name, e)
             return InstallResult(
                 success=False,
                 message=f"文件复制失败：{e}",

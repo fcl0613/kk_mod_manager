@@ -8,6 +8,7 @@
   - 底部状态栏
 """
 
+from enum import Enum
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -34,6 +35,12 @@ from app.ui.card_parse_page import CardParsePage
 from app.ui.batch_install_dialog import BatchInstallDialog
 
 
+class PendingAction(Enum):
+    """重试操作类型"""
+    INSTALL = "install"
+    INSTALL_AND_COLLECT = "install_and_collect"
+
+
 class MainWindow(QMainWindow):
     """主窗口"""
 
@@ -43,6 +50,7 @@ class MainWindow(QMainWindow):
         self._card_result: CardParseResult | None = None  # 最近一次卡片解析结果
         self._pending_path: Path | None = None  # 等待重试的原始文件路径
         self._pending_location: ModLocation | None = None  # 等待重试的目标位置
+        self._pending_action: PendingAction | None = None  # 等待重试的操作类型
 
         # 分页状态
         self._page_size = 200  # 每页默认 200 个 Mod
@@ -533,8 +541,8 @@ class MainWindow(QMainWindow):
 
         self.status_bar.showMessage("正在安装并收藏...")
         self._pending_path = Path(file_path)
-        self._pending_location = ModLocation.REPO  # 先装仓库
-        result = self._mod_service.install_and_collect(file_path)
+        self._pending_action = PendingAction.INSTALL_AND_COLLECT
+        result = self._mod_service.install_and_collect(Path(file_path))
         self._handle_install_result(result)
 
     def _batch_install(self, location: ModLocation):
@@ -560,6 +568,7 @@ class MainWindow(QMainWindow):
         # 保存原始路径，用于重试
         self._pending_path = Path(file_path)
         self._pending_location = location
+        self._pending_action = PendingAction.INSTALL
 
         result: InstallResult
 
@@ -605,7 +614,13 @@ class MainWindow(QMainWindow):
                     QMessageBox.warning(self, "错误", "内部错误：丢失文件路径")
                     return
 
-                if self._pending_location == ModLocation.GAME:
+                if self._pending_action == PendingAction.INSTALL_AND_COLLECT:
+                    retry = self._mod_service.install_and_collect(
+                        self._pending_path,
+                        confirm_upgrade=dialog.confirm_upgrade,
+                        confirm_downgrade=dialog.confirm_downgrade,
+                    )
+                elif self._pending_location == ModLocation.GAME:
                     retry = self._mod_service.install_to_game(
                         self._pending_path,
                         confirm_upgrade=dialog.confirm_upgrade,

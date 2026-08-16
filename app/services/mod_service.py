@@ -964,7 +964,8 @@ class ModService:
                 continue
             try:
                 manifest = self.manifest_svc.parse_from_zipmod(zipmod_file)
-            except ManifestParseError:
+            except ManifestParseError as e:
+                logger.warning("刷新扫描 - 跳过无效 Mod: {} - {}", zipmod_file, e)
                 continue
 
             # 同一位置下按 GUID 去重（避免硬链接导致重复扫描）

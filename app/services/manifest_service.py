@@ -4,7 +4,7 @@
   - F02-1: 读取 .zipmod 内的 manifest.xml
   - F02-2: 提取 guid/name/version/author/description/website
   - F02-3: 无 manifest.xml → 拒绝
-  - F02-5: 兼容 UTF-8 BOM
+  - F02-5: 兼容 UTF-8 / UTF-16 BOM
   - F03-1~6: 基于 GUID 的重复检测和版本比较
   - BR-V01~V03: 语义化版本比较，失败则保守处理
 """
@@ -123,9 +123,29 @@ class ManifestService:
                     f"请确认这是有效的 Sideloader zipmod 文件"
                 )
             with zf.open(self.MANIFEST_FILENAME) as f:
-                raw = f.read().decode("utf-8-sig")  # 处理 BOM（F02-5）
+                raw = self._decode_manifest(f.read(), path.name)
 
         return self._parse_xml(raw, path.name)
+
+    def _decode_manifest(self, data: bytes, source_name: str) -> str:
+        """按 BOM 自动识别编码，兼容 UTF-8 / UTF-16。
+
+        UTF-16 的 BOM（FF FE / FE FF）会被 utf-8-sig 误判为非法起始字节，
+        需优先识别。无 BOM 时回退到 UTF-8 处理。
+
+        Raises:
+            ManifestParseError: 编码无法识别
+        """
+        if data.startswith(b"\xff\xfe"):
+            return data.decode("utf-16-le")
+        if data.startswith(b"\xfe\xff"):
+            return data.decode("utf-16-be")
+        try:
+            return data.decode("utf-8-sig")  # 兼容 UTF-8 BOM（F02-5）
+        except UnicodeDecodeError as e:
+            raise ManifestParseError(
+                f"manifest.xml 编码无法识别：{e}（来源：{source_name}）"
+            ) from e
 
     def _parse_xml(self, xml_content: str, source_name: str) -> ModManifest:
         """解析 XML 内容为 ModManifest"""

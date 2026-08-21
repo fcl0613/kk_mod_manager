@@ -1,6 +1,7 @@
 [project]
 name = "kk_mod_manager"
-version = "0.1.0"
+# 版本号单一来源在 app/__init__.py 的 __version__；发布时需同步更新此处
+version = "0.0.1"
 description = "KK Mod Manager - Illusion 系列游戏桌面端 Mod 管理工具"
 requires-python = ">=3.11"
 dependencies = [

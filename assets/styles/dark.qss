@@ -295,3 +295,13 @@ QLabel#cardTypeLabel {
     color: #a6adc8;
     font-size: 12px;
 }
+
+/* 更新徽章（叠加在工具栏"⚙ 设置"按钮右上角） */
+QLabel#updateBadge {
+    background-color: #f38ba8;
+    color: #1e1e2e;
+    font-size: 9px;
+    font-weight: bold;
+    border-radius: 8px;
+    padding: 0 4px;
+}

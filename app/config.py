@@ -50,8 +50,34 @@ class AppConfig(BaseModel):
         default=True, description="卸载/移除后清理空作者目录"
     )
 
+    # ── 更新检查 ──
+    update_check_enabled: bool = Field(
+        default=True, description="启动时自动检查更新"
+    )
+    update_last_check_at: str = Field(
+        default="", description="最近一次检查更新的 ISO 时间戳"
+    )
+    update_skipped_version: str = Field(
+        default="", description="用户选择跳过的版本"
+    )
+    update_notified_version: str = Field(
+        default="", description="已提示过用户的版本"
+    )
+    update_check_interval_days: int = Field(
+        default=1, description="自动检查间隔天数"
+    )
+    update_latest_version: str = Field(
+        default="", description="最近一次检查到的最新版本号（含已是最新的情况）"
+    )
+    update_latest_url: str = Field(
+        default="", description="最新版本的 Release 页面 URL"
+    )
+    update_latest_is_prerelease: bool = Field(
+        default=False, description="最近记录的最新版本是否为预览版"
+    )
+
     # ── 版本 ──
-    config_version: str = Field(default="1", description="配置文件版本号")
+    config_version: str = Field(default="2", description="配置文件版本号")
 
 
 def _get_config_dir() -> Path:
@@ -70,15 +96,30 @@ def _get_config_path() -> Path:
 
 
 def load_config() -> AppConfig:
-    """加载配置，不存在时返回默认配置"""
+    """加载配置，不存在时返回默认配置
+
+    旧版本 config.json 自动升级：
+      - Pydantic 用默认值填充缺失字段（无需显式迁移）
+      - 若发现 config_version < "2"，主动写回新 schema 以便新字段落盘
+    """
     config_path = _get_config_path()
+    cfg = AppConfig()
     if config_path.exists():
         try:
             data = json.loads(config_path.read_text(encoding="utf-8"))
-            return AppConfig(**data)
+            cfg = AppConfig(**data)
         except Exception:
             pass
-    return AppConfig()
+
+    # 配置版本升级：触发重写以落盘新字段
+    if cfg.config_version != "2":
+        cfg.config_version = "2"
+        try:
+            save_config(cfg)
+        except Exception:
+            pass
+
+    return cfg
 
 
 def save_config(config: AppConfig) -> None:

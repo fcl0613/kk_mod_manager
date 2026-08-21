@@ -27,6 +27,8 @@ a = Analysis(
         "PyQt6.QtCore",
         "PyQt6.QtGui",
         "PyQt6.QtWidgets",
+        "PyQt6.QtNetwork",  # 更新检查服务用
+        "app",  # 确保 app/__init__.py 中的 __version__ 被识别
         # 数据库
         "sqlalchemy",
         "sqlalchemy.ext.declarative",

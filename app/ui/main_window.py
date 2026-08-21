@@ -8,6 +8,7 @@
   - 底部状态栏
 """
 
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 
@@ -27,12 +28,16 @@ from app.database import init_db, get_session, get_db_path
 from app.models.mod import Mod, ModLocation, ModStatus, OperationLog
 from app.services.mod_service import ModService, InstallResult
 from app.services.card_service import CardService, CardParseResult
+from app.services.update_service import (
+    UpdateService, UpdateResult, UpdateStatus, RELEASES_PAGE_URL,
+)
 from app.ui.settings_dialog import SettingsDialog
 from app.ui.install_dialog import InstallConfirmDialog
 from app.ui.mod_detail_panel import ModDetailPanel
 from app.ui.card_result_dialog import CardResultDialog
 from app.ui.card_parse_page import CardParsePage
 from app.ui.batch_install_dialog import BatchInstallDialog
+from app.ui.update_dialog import UpdateDialog
 
 
 class PendingAction(Enum):
@@ -64,6 +69,14 @@ class MainWindow(QMainWindow):
         self._mod_service = ModService(get_session())
         self._card_service = CardService()
 
+        # 更新检查服务
+        self._update_service = UpdateService(self)
+        self._update_service.checked.connect(self._on_update_checked)
+        # 记录上次已知"有更新"的版本，启动时用于恢复徽章
+        self._known_available_version = self._config.update_notified_version
+        # 当前打开的设置对话框（检查完成后即时刷新版本显示）
+        self._settings_dialog: SettingsDialog | None = None
+
         self._setup_ui()
         self._load_theme()
         self._check_first_run()
@@ -71,6 +84,13 @@ class MainWindow(QMainWindow):
         # 首次启动加载已有数据
         self._refresh_game_list()
         self._update_status_bar()
+
+        # 如果上次已通知过某版本，恢复 NEW 徽章
+        if self._known_available_version:
+            self._set_update_badge_visible(True)
+
+        # 延迟 3 秒后自动检查更新（避免阻塞首屏渲染）
+        QTimer.singleShot(3000, self._auto_check_update)
 
     # ═══════════════════════════════════════════════════════
     # UI 构建
@@ -221,9 +241,18 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
 
         # 设置按钮
-        settings_btn = QPushButton("⚙ 设置")
-        settings_btn.clicked.connect(self._open_settings)
-        toolbar.addWidget(settings_btn)
+        self.settings_btn = QPushButton("⚙ 设置")
+        self.settings_btn.clicked.connect(self._open_settings)
+        toolbar.addWidget(self.settings_btn)
+
+        # NEW 徽章（叠加在设置按钮右上角，默认隐藏）
+        self.update_badge = QLabel("NEW", self.settings_btn)
+        self.update_badge.setObjectName("updateBadge")
+        self.update_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.update_badge.setFixedSize(32, 16)
+        self.update_badge.hide()
+        # 初始化位置（按钮创建后第一次调整）
+        QTimer.singleShot(0, self._reposition_update_badge)
 
         # 初始化MOD按钮
         init_mod_btn = QPushButton("🔄 初始化MOD")
@@ -901,7 +930,16 @@ class MainWindow(QMainWindow):
 
     def _open_settings(self):
         dialog = SettingsDialog(self)
-        if dialog.exec() == SettingsDialog.DialogCode.Accepted:
+        # 主窗口接收"立即检查更新"信号，触发实际检查
+        dialog.update_check_requested.connect(self._on_manual_update_check)
+        # 暴露给 _on_update_checked，使检查结果能即时刷新版本显示
+        self._settings_dialog = dialog
+        try:
+            accepted = dialog.exec() == SettingsDialog.DialogCode.Accepted
+        finally:
+            self._settings_dialog = None
+
+        if accepted:
             reload_config()
             self._config = get_config()
             self._load_theme()
@@ -1033,4 +1071,201 @@ class MainWindow(QMainWindow):
         self._config.window_height = self.height()
         save_config(self._config)
         self._mod_service.session.close()
+        # 取消可能在飞行中的更新检查请求
+        if hasattr(self, "_update_service"):
+            self._update_service.cancel()
         event.accept()
+
+    # ═══════════════════════════════════════════════════════
+    # 更新检查
+    # ═══════════════════════════════════════════════════════
+
+    def _auto_check_update(self):
+        """启动后自动检查更新（受配置和节流控制）"""
+        logger.info("[update] 启动后自动检查更新入口")
+        cfg = self._config
+        if not cfg.update_check_enabled:
+            logger.info("[update] 自动检查已禁用（update_check_enabled=False），跳过")
+            return
+
+        # 节流：距上次检查 < N 天则跳过
+        last = cfg.update_last_check_at
+        interval_days = cfg.update_check_interval_days
+        logger.info(
+            "[update] 节流检查：上次检查时间={} 间隔天数={} 当前版本={}",
+            last or "（从未）", interval_days, self._update_service.current_version,
+        )
+        if last and interval_days > 0:
+            try:
+                last_dt = datetime.fromisoformat(last)
+                elapsed = datetime.now() - last_dt
+                if elapsed.days < interval_days:
+                    logger.info(
+                        "[update] 节流命中：距上次仅 {} 天（< {} 天），跳过自动检查",
+                        elapsed.days, interval_days,
+                    )
+                    return
+                else:
+                    logger.info(
+                        "[update] 节流未命中：距上次 {} 天（>= {} 天），继续检查",
+                        elapsed.days, interval_days,
+                    )
+            except ValueError as e:
+                logger.warning(
+                    "[update] 上次检查时间戳格式损坏：{}={}，跳过节流检查",
+                    last, e,
+                )
+
+        # 检测版本变化：用户已升级，主动重置 skip 字段
+        if (
+            cfg.update_notified_version
+            and cfg.update_notified_version != self._update_service.current_version
+            and self._update_service.current_version > "0.0.0"
+        ):
+            logger.info(
+                "[update] 检测到版本变化：notified={} → current={}，重置 skipped_version",
+                cfg.update_notified_version, self._update_service.current_version,
+            )
+            cfg.update_skipped_version = ""
+
+        logger.info("[update] 触发自动检查请求 → UpdateService.check()")
+        self._update_service.check()
+
+    def _on_manual_update_check(self):
+        """用户手动触发的检查（设置页按钮），绕过节流"""
+        logger.info("[update] 手动检查更新入口（设置页按钮）")
+        # 同时刷新已知版本（可能用户已升级）
+        if self._config.update_notified_version != self._update_service.current_version:
+            logger.info(
+                "[update] 检测到版本变化：notified={} → current={}，重置 skip/notified",
+                self._config.update_notified_version,
+                self._update_service.current_version,
+            )
+            self._config.update_skipped_version = ""
+            self._config.update_notified_version = ""
+        # 若已有请求在飞行中，避免静默吞掉点击导致状态栏假象
+        if self._update_service.is_busy():
+            logger.info("[update] 上一次请求尚未完成，跳过本次手动触发")
+            self.status_bar.showMessage("正在检查更新...（上一次请求尚未完成）", 5000)
+            return
+        logger.info("[update] 触发手动检查请求 → UpdateService.check()")
+        self._update_service.check()
+        # 使用 15 秒超时：若 check 真挂死（理论上 QTimer 应能 abort）也保证状态栏能恢复
+        self.status_bar.showMessage("正在检查更新...", 15000)
+
+    def _on_update_checked(self, result: UpdateResult):
+        """UpdateService 结果回调"""
+        logger.info(
+            "[update] 收到结果：status={} current={} latest={} error={}",
+            result.status.value, result.current, result.latest or "（空）",
+            result.error or "（无）",
+        )
+        cfg = self._config
+
+        # 统一写入"最近检查时间"
+        cfg.update_last_check_at = datetime.now().isoformat()
+
+        # 记录最新版本信息（供设置页展示 + "前往下载页面"按钮使用）
+        if result.latest:
+            cfg.update_latest_version = result.latest
+            cfg.update_latest_url = result.release_url or RELEASES_PAGE_URL
+            cfg.update_latest_is_prerelease = (
+                result.status == UpdateStatus.PRERELEASE_AVAILABLE
+            )
+            logger.info(
+                "[update] 记录最新版本：{}（prerelease={} url={}）",
+                cfg.update_latest_version, cfg.update_latest_is_prerelease,
+                cfg.update_latest_url,
+            )
+
+        if result.status == UpdateStatus.UPDATE_AVAILABLE:
+            logger.info("[update] 分支：UPDATE_AVAILABLE → 调用 _handle_update_available")
+            self._handle_update_available(result)
+        elif result.status == UpdateStatus.PRERELEASE_AVAILABLE:
+            logger.info("[update] 分支：PRERELEASE_AVAILABLE → 显示状态栏提示")
+            logger.info("发现 prerelease 版本 {}，已忽略", result.latest)
+            self.status_bar.showMessage(f"暂无稳定版更新（prerelease {result.latest}）", 3000)
+        elif result.status == UpdateStatus.UP_TO_DATE:
+            logger.info("[update] 分支：UP_TO_DATE → 清除徽章 + 显示提示")
+            logger.debug("已是最新版本 {}", result.latest or cfg.update_last_check_at)
+            # 已是最新时清除徽章
+            self._set_update_badge_visible(False)
+            self._known_available_version = ""
+            cfg.update_notified_version = ""
+            # 反馈给用户（覆盖"正在检查更新..."），3 秒后自动恢复统计信息
+            if result.latest:
+                self.status_bar.showMessage(f"已是最新版本 v{result.latest}", 3000)
+            else:
+                self.status_bar.showMessage("已是最新版本", 3000)
+        elif result.status == UpdateStatus.NETWORK_ERROR:
+            logger.info("[update] 分支：NETWORK_ERROR → 显示状态栏提示")
+            logger.warning("更新检查网络错误: {}", result.error)
+            self.status_bar.showMessage("暂时无法检查更新", 3000)
+        elif result.status == UpdateStatus.RATE_LIMITED:
+            logger.info("[update] 分支：RATE_LIMITED → 显示限速提示")
+            logger.warning("更新检查被 GitHub API 限速")
+            self.status_bar.showMessage("暂时无法检查更新，请稍后再试", 3000)
+        elif result.status == UpdateStatus.PARSE_ERROR:
+            logger.info("[update] 分支：PARSE_ERROR → 显示解析失败提示")
+            logger.warning("更新检查解析失败: {}", result.error)
+            self.status_bar.showMessage("暂时无法检查更新", 3000)
+        else:
+            logger.warning("[update] 未知 status：{}", result.status)
+
+        try:
+            save_config(cfg)
+            logger.debug("[update] 配置已保存：update_last_check_at={}", cfg.update_last_check_at)
+        except Exception as e:
+            logger.warning("[update] 保存配置失败：{}", e)
+
+        # 设置页正开着时即时刷新版本记录显示
+        if self._settings_dialog is not None:
+            self._settings_dialog.refresh_update_info()
+
+    def _handle_update_available(self, result: UpdateResult):
+        """处理发现新版本的情况：显示徽章 + 弹通知"""
+        cfg = self._config
+
+        # 显示徽章
+        self._set_update_badge_visible(True)
+        self._known_available_version = result.latest
+
+        # 已通知过该版本且未被跳过 → 不再弹对话框
+        already_notified = cfg.update_notified_version == result.latest
+        is_skipped = cfg.update_skipped_version == result.latest
+
+        if already_notified or is_skipped:
+            logger.debug(
+                "新版本 {} 已通知过={} 已跳过={}，不弹对话框",
+                result.latest, already_notified, is_skipped,
+            )
+            self.status_bar.showMessage(
+                f"新版本 v{result.latest} 可用（设置页查看详情）", 3000
+            )
+            return
+
+        # 首次发现 → 弹对话框 + 记录已通知
+        logger.info("首次发现新版本 v{}，弹出通知对话框", result.latest)
+        dialog = UpdateDialog(result, parent=self)
+        dialog.exec()
+
+        cfg.update_notified_version = result.latest
+        self.status_bar.showMessage(f"🎉 发现新版本 v{result.latest}", 5000)
+
+    def _set_update_badge_visible(self, visible: bool):
+        """显示/隐藏 NEW 徽章"""
+        if visible:
+            self._reposition_update_badge()
+            self.update_badge.show()
+            self.update_badge.raise_()
+        else:
+            self.update_badge.hide()
+
+    def _reposition_update_badge(self):
+        """将 NEW 徽章定位到设置按钮右上角"""
+        if not hasattr(self, "update_badge") or not hasattr(self, "settings_btn"):
+            return
+        btn_w = self.settings_btn.width()
+        badge_w = self.update_badge.width()
+        # 右上角偏移
+        self.update_badge.move(btn_w - badge_w + 4, -4)

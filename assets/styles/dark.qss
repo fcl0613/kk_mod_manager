@@ -30,6 +30,30 @@ QToolBar QToolButton:hover {
 QToolBar QToolButton:pressed {
     background-color: #585b70;
 }
+/* 按钮文字已带 ▾，隐藏 Qt 自带菜单指示箭头（避免双箭头） */
+QToolBar QToolButton::menu-indicator {
+    image: none;
+}
+
+/* 右键/下拉菜单 */
+QMenu {
+    background-color: #313244;
+    border: 1px solid #45475a;
+    border-radius: 4px;
+    padding: 4px;
+}
+QMenu::item {
+    padding: 6px 24px;
+    border-radius: 4px;
+}
+QMenu::item:selected {
+    background-color: #45475a;
+}
+QMenu::separator {
+    height: 1px;
+    background-color: #45475a;
+    margin: 4px 8px;
+}
 
 /* 搜索框 */
 QLineEdit {

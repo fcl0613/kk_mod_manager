@@ -17,9 +17,10 @@ from PyQt6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QSplitter,
     QTabWidget, QTabBar, QStackedWidget,
     QStatusBar, QFileDialog, QMessageBox, QProgressDialog,
+    QToolButton, QMenu,
 )
 from PyQt6.QtCore import Qt, QSize, QTimer
-from PyQt6.QtGui import QDragEnterEvent, QDropEvent
+from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QShortcut, QKeySequence
 from loguru import logger
 
 from app.config import get_config, save_config, reload_config
@@ -33,6 +34,7 @@ from app.ui.mod_detail_panel import ModDetailPanel
 from app.ui.card_result_dialog import CardResultDialog
 from app.ui.card_parse_page import CardParsePage
 from app.ui.batch_install_dialog import BatchInstallDialog
+from app.ui.sync_dialog import SyncDialog
 
 
 class PendingAction(Enum):
@@ -165,70 +167,81 @@ class MainWindow(QMainWindow):
         return page
 
     def _create_toolbar(self):
-        """创建顶部工具栏"""
+        """创建顶部工具栏（分组下拉布局）
+
+        [➕ 安装 ▾] [🗂 批量 ▾] [🔄 数据 ▾] │ 搜索 [______] │ [⚙]
+        """
         toolbar = QToolBar()
         toolbar.setMovable(False)
         toolbar.setIconSize(QSize(20, 20))
         self.addToolBar(toolbar)
 
-        # 安装到游戏
-        install_btn = QPushButton("📦 安装到游戏")
-        install_btn.clicked.connect(lambda: self._install_mod(ModLocation.GAME))
+        def make_menu_btn(text: str, tooltip: str) -> QToolButton:
+            """统一构造 InstantPopup 下拉按钮（文字带 ▾，箭头由 QSS 隐藏）"""
+            btn = QToolButton()
+            btn.setText(text)
+            btn.setToolTip(tooltip)
+            btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+            btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+            btn.setMenu(QMenu(btn))
+            return btn
+
+        # ➕ 安装
+        install_btn = make_menu_btn("➕ 安装 ▾", "安装 / 收藏 zipmod")
+        install_btn.menu().addAction(
+            "📦 安装到游戏", lambda: self._install_mod(ModLocation.GAME))
+        install_btn.menu().addAction(
+            "📁 添加到仓库", lambda: self._install_mod(ModLocation.REPO))
+        install_btn.menu().addAction("📦+📁 安装并收藏", self._install_and_collect)
         toolbar.addWidget(install_btn)
 
-        # 添加到仓库
-        repo_btn = QPushButton("📁 添加到仓库")
-        repo_btn.clicked.connect(lambda: self._install_mod(ModLocation.REPO))
-        toolbar.addWidget(repo_btn)
+        # 🗂 批量
+        batch_btn = make_menu_btn("🗂 批量 ▾", "批量添加多个 .zipmod 文件")
+        batch_btn.menu().addAction(
+            "批量安装到游戏", lambda: self._batch_install(ModLocation.GAME))
+        batch_btn.menu().addAction(
+            "批量添加到仓库", lambda: self._batch_install(ModLocation.REPO))
+        toolbar.addWidget(batch_btn)
 
-        # 安装并收藏
-        both_btn = QPushButton("📦+📁 安装并收藏")
-        both_btn.clicked.connect(self._install_and_collect)
-        toolbar.addWidget(both_btn)
-
-        toolbar.addSeparator()
-
-        # 批量添加到游戏
-        batch_game_btn = QPushButton("🗂 批量→游戏")
-        batch_game_btn.setToolTip("批量添加多个 .zipmod 文件到游戏 Mod 目录")
-        batch_game_btn.clicked.connect(lambda: self._batch_install(ModLocation.GAME))
-        toolbar.addWidget(batch_game_btn)
-
-        # 批量添加到仓库
-        batch_repo_btn = QPushButton("🗂 批量→仓库")
-        batch_repo_btn.setToolTip("批量添加多个 .zipmod 文件到本地仓库")
-        batch_repo_btn.clicked.connect(lambda: self._batch_install(ModLocation.REPO))
-        toolbar.addWidget(batch_repo_btn)
+        # 🔄 数据
+        data_btn = make_menu_btn("🔄 数据 ▾", "数据库与磁盘的同步 / 重建")
+        data_btn.menu().addAction("⟳ 同步磁盘（保留备注）", self._sync_mods)
+        data_btn.menu().addSeparator()
+        data_btn.menu().addAction("⚠ 初始化MOD（清空重建）", self._init_mod)
+        toolbar.addWidget(data_btn)
 
         toolbar.addSeparator()
 
-        # 刷新按钮
-        refresh_btn = QPushButton("🔄 刷新")
-        refresh_btn.clicked.connect(self._refresh_current)
-        toolbar.addWidget(refresh_btn)
-
-        toolbar.addSeparator()
-
-        # 搜索框
-        search_label = QLabel("搜索：")
-        toolbar.addWidget(search_label)
+        # 搜索框（占位符已说明用途，不再加标签）
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("名称/作者/GUID...")
-        self.search_edit.setFixedWidth(200)
+        self.search_edit.setPlaceholderText("🔍 搜索：名称/作者/GUID...")
+        self.search_edit.setFixedWidth(260)
         self.search_edit.textChanged.connect(self._on_search)
         toolbar.addWidget(self.search_edit)
 
         toolbar.addSeparator()
 
-        # 设置按钮
-        settings_btn = QPushButton("⚙ 设置")
+        # 设置（图标式）
+        settings_btn = QToolButton()
+        settings_btn.setText("⚙")
+        settings_btn.setToolTip("设置")
         settings_btn.clicked.connect(self._open_settings)
         toolbar.addWidget(settings_btn)
 
-        # 初始化MOD按钮
-        init_mod_btn = QPushButton("🔄 初始化MOD")
-        init_mod_btn.clicked.connect(self._init_mod)
-        toolbar.addWidget(init_mod_btn)
+        # 刷新（独立按钮，高频操作一步直达）
+        refresh_btn = QToolButton()
+        refresh_btn.setText("🔄 刷新")
+        refresh_btn.setToolTip("刷新当前列表（F5）")
+        refresh_btn.clicked.connect(self._refresh_current)
+        toolbar.addWidget(refresh_btn)
+
+        # ── 快捷键 ──────────────────────────────────────────
+        refresh_sc = QShortcut(QKeySequence("F5"), self)
+        refresh_sc.activated.connect(self._refresh_current)
+
+        search_sc = QShortcut(QKeySequence("Ctrl+F"), self)
+        search_sc.activated.connect(self.search_edit.setFocus)
+        search_sc.activated.connect(self.search_edit.selectAll)
 
     def _create_left_panel(self) -> QWidget:
         """创建左侧面板（Tab 切换游戏/仓库的 Mod 列表）"""
@@ -994,6 +1007,42 @@ class MainWindow(QMainWindow):
                     f"数据库初始化失败：{str(e)}",
                     QMessageBox.StandardButton.Ok
                 )
+
+    def _sync_mods(self):
+        """磁盘 → 数据库 增量同步（后台线程）"""
+        config = get_config()
+        if not config.game_mod_path and not config.repo_path:
+            QMessageBox.warning(
+                self, "提示",
+                "请先在设置中配置游戏 Mod 路径或本地仓库路径",
+            )
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "同步磁盘 Mod",
+            "将以磁盘文件为准同步数据库：\n\n"
+            "  • 磁盘新增的 zipmod → 导入数据库\n"
+            "  • 磁盘已消失的文件 → 删除对应记录\n"
+            "  • 文件改名/移动/换版本/启用禁用 → 更新记录（保留备注）\n\n"
+            "继续同步？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        dialog = SyncDialog(self)
+        dialog.sync_finished.connect(self._on_sync_finished)
+        dialog.exec()
+
+    def _on_sync_finished(self):
+        """同步完成后刷新两个位置的列表"""
+        # worker 用独立 session 提交，主窗口 session 的 identity map
+        # 里可能还是旧对象，必须先过期再重查
+        self._mod_service.session.expire_all()
+        self._refresh_game_list()
+        self._refresh_repo_list()
 
     def _load_theme(self):
         """加载主题样式"""

@@ -141,6 +141,15 @@ class SyncReport:
         )
 
 
+def _normalize_author(author: str | None) -> str:
+    """落库作者名：空值统一为 "Unknown"。
+
+    与列表分组（group_by_author）、目录规则（get_author_dir）的展示一致，
+    保证搜索 "Unknown" 能命中（空串不会 LIKE 匹配）。
+    """
+    return (author or "").strip() or "Unknown"
+
+
 class ModService:
     """Mod 核心业务服务"""
 
@@ -249,7 +258,6 @@ class ModService:
             dest_file = safe_copy(
                 src=zipmod_path,
                 dst_dir=author_dir,
-                author=manifest.display_author,
                 file_name=zipmod_path.name,
                 version=manifest.version,
             )
@@ -267,7 +275,7 @@ class ModService:
             guid=manifest.guid,
             name=manifest.name,
             version=manifest.version,
-            author=manifest.author,
+            author=_normalize_author(manifest.author),
             author_normalized=manifest.author_normalized,
             description=manifest.description,
             website=manifest.website,
@@ -381,7 +389,6 @@ class ModService:
             dest_file = safe_copy(
                 src=zipmod_path,
                 dst_dir=author_dir,
-                author=manifest.display_author,
                 file_name=zipmod_path.name,
                 version=manifest.version,
             )
@@ -399,7 +406,7 @@ class ModService:
             guid=manifest.guid,
             name=manifest.name,
             version=manifest.version,
-            author=manifest.author,
+            author=_normalize_author(manifest.author),
             author_normalized=manifest.author_normalized,
             description=manifest.description,
             website=manifest.website,
@@ -669,7 +676,6 @@ class ModService:
             dest_file = safe_copy(
                 src=src_file,
                 dst_dir=game_author_dir,
-                author=repo_mod.author or "Unknown",
                 file_name=src_file.name,
                 version=repo_mod.version,
             )
@@ -685,7 +691,7 @@ class ModService:
             guid=repo_mod.guid,
             name=repo_mod.name,
             version=repo_mod.version,
-            author=repo_mod.author,
+            author=_normalize_author(repo_mod.author),
             author_normalized=repo_mod.author_normalized,
             description=repo_mod.description,
             website=repo_mod.website,
@@ -781,7 +787,6 @@ class ModService:
             dest_file = safe_copy(
                 src=src_file,
                 dst_dir=repo_author_dir,
-                author=game_mod.author or "Unknown",
                 file_name=src_file.name,
                 version=game_mod.version,
             )
@@ -797,7 +802,7 @@ class ModService:
             guid=game_mod.guid,
             name=game_mod.name,
             version=game_mod.version,
-            author=game_mod.author,
+            author=_normalize_author(game_mod.author),
             author_normalized=game_mod.author_normalized,
             description=game_mod.description,
             website=game_mod.website,
@@ -1030,7 +1035,7 @@ class ModService:
                 guid=manifest.guid,
                 name=manifest.name,
                 version=manifest.version,
-                author=manifest.author,
+                author=_normalize_author(manifest.author),
                 author_normalized=manifest.author_normalized,
                 description=manifest.description,
                 website=manifest.website,
@@ -1153,8 +1158,8 @@ class ModService:
 
             if mod is None:
                 manifest = chosen["manifest"]
-                author = manifest.author
-                if not author and chosen["path"].parent != base_path:
+                author = _normalize_author(manifest.author)
+                if not manifest.author and chosen["path"].parent != base_path:
                     # 文件在子目录中，用目录名推断作者（与 refresh_from_disk 一致）
                     author = chosen["path"].parent.name
                 new_mod = Mod(
@@ -1162,7 +1167,7 @@ class ModService:
                     name=manifest.name,
                     version=manifest.version,
                     author=author,
-                    author_normalized=(author.strip().lower() if author else "unknown"),
+                    author_normalized=author.strip().lower(),
                     description=manifest.description,
                     website=manifest.website,
                     file_name=chosen["path"].name,
@@ -1182,7 +1187,7 @@ class ModService:
                 report.added.append(SyncChangeItem(
                     action="added", guid=guid, name=manifest.name,
                     file_name=chosen["path"].name,
-                    detail=f"v{manifest.version} 作者 {author or 'Unknown'}",
+                    detail=f"v{manifest.version} 作者 {author}",
                 ))
             else:
                 item = self._apply_mod_update(
@@ -1314,6 +1319,20 @@ class ModService:
             changes.append(f"作者 {mod.author or '(空)'} → {manifest.author}")
             mod.author = manifest.author
             mod.author_normalized = manifest.author_normalized
+
+        # manifest 无作者 → DB 的 author 是目录推断值（或空）。
+        # 文件被移动到其他子目录后按实际目录重新推断：
+        #   GAME 端路径完全靠「作者目录/文件名」推导，不更正会导致
+        #   卸载/启停定位失败，磁盘残留孤儿文件。
+        # manifest 有作者时不做此更正（manifest 元数据优先于目录名）。
+        if not manifest.author and file_path.parent != base_path:
+            dir_name = file_path.parent.name
+            if (mod.author or "").strip().lower() != dir_name.strip().lower():
+                changes.append(
+                    f"作者目录 {mod.author or '(空)'} → {dir_name}（按实际位置更正）"
+                )
+                mod.author = dir_name
+                mod.author_normalized = dir_name.strip().lower()
 
         if not changes:
             return None
@@ -1500,7 +1519,6 @@ class ModService:
             dest_file = safe_copy(
                 src=fp,
                 dst_dir=author_dir,
-                author=manifest.display_author,
                 file_name=fp.name,
                 version=manifest.version,
             )
@@ -1518,7 +1536,7 @@ class ModService:
             guid=manifest.guid,
             name=manifest.name,
             version=manifest.version,
-            author=manifest.author,
+            author=_normalize_author(manifest.author),
             author_normalized=manifest.author_normalized,
             description=manifest.description,
             website=manifest.website,

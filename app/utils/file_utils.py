@@ -22,7 +22,6 @@ def ensure_dir(path: Path) -> Path:
 def safe_copy(
     src: Path,
     dst_dir: Path,
-    author: str,
     file_name: str,
     version: str,
 ) -> Path:

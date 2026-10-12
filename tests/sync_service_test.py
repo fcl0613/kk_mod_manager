@@ -41,16 +41,17 @@ def make_zipmod(
     file_stem: str,
     guid: str,
     version: str = "1.0.0",
-    author: str = "TestAuthor",
+    author: str | None = "TestAuthor",
     disabled: bool = False,
 ) -> Path:
-    """造一个含 manifest.xml 的 zipmod 文件"""
+    """造一个含 manifest.xml 的 zipmod 文件（author 为 None 时不写 <author> 标签）"""
+    author_part = f"<author>{author}</author>" if author else ""
     body = (
         "<manifest>"
         f"<guid>{guid}</guid>"
         f"<name>{file_stem}</name>"
         f"<version>{version}</version>"
-        f"<author>{author}</author>"
+        f"{author_part}"
         "</manifest>"
     )
     fn = file_stem + (".zipmod_disabled" if disabled else ".zipmod")
@@ -233,5 +234,75 @@ if __name__ == "__main__":
         )
         report = svc.sync_from_disk(ModLocation.GAME)
         check(report.skipped and "未配置" in report.message, "GAME 未配置 → skipped")
+
+        # 用例 11 改写过配置，恢复后再继续
+        cfg._config_instance = AppConfig(
+            game_mod_path=str(game), repo_path=str(repo)
+        )
+
+        # ── 用例 12：无作者 mod 移动目录 → author 跟随实际目录 ──
+        print("[12] 无作者 mod 移到其他目录 → author 更正，卸载不留孤儿文件")
+        und = game / "Unknown"
+        und.mkdir(exist_ok=True)
+        make_zipmod(und, "NoAuth", "guid.noauth", author=None)
+        svc.sync_from_disk(ModLocation.GAME)
+        zed = game / "Zed"
+        zed.mkdir(exist_ok=True)
+        (und / "NoAuth.zipmod").rename(zed / "NoAuth.zipmod")
+        report = svc.sync_from_disk(ModLocation.GAME)
+        svc.session.expire_all()
+        na = next(m for m in query_mods(svc, ModLocation.GAME)
+                  if m.guid == "guid.noauth")
+        check(na.author == "Zed", "author 按实际目录更正为 Zed")
+        check(any(i.guid == "guid.noauth" and "作者目录" in i.detail
+                  for i in report.updated), "报告含作者目录更正明细")
+        res = svc.uninstall(na.id)
+        check(res.success, "卸载成功")
+        check(not (zed / "NoAuth.zipmod").exists(), "Zed 下文件已删除（无孤儿）")
+        # REPO 端同样跟随目录（repo_relative_path 是路径真值，此处仅元数据一致性）
+        rund = repo / "Unknown"
+        rund.mkdir(exist_ok=True)
+        make_zipmod(rund, "NoAuthR", "guid.noauth_r", author=None)
+        svc.sync_from_disk(ModLocation.REPO)
+        (rund / "NoAuthR.zipmod").rename(subdir / "NoAuthR.zipmod")
+        svc.sync_from_disk(ModLocation.REPO)
+        svc.session.expire_all()
+        nar = next(m for m in query_mods(svc, ModLocation.REPO)
+                   if m.guid == "guid.noauth_r")
+        check(nar.author == "Xavier", "REPO author 同样跟随实际目录")
+
+        # ── 用例 13：安装无作者 zipmod → Unknown 目录 + 可搜索 ──
+        print("[13] 安装无作者 zipmod → 落 Unknown 目录、author=Unknown、可搜索")
+        src = make_zipmod(root, "SrcNoAuth", "guid.src_noauth", author=None)
+        res = svc.install_to_game(src)
+        check(res.success, "安装成功")
+        check((game / "Unknown" / "SrcNoAuth.zipmod").exists(),
+              "文件落入 Unknown 目录")
+        svc.session.expire_all()
+        hits = svc.get_mods_by_location(ModLocation.GAME, "Unknown")
+        check(any(m.guid == "guid.src_noauth" for m in hits),
+              "搜索 Unknown 可命中")
+        sna = next(m for m in query_mods(svc, ModLocation.GAME)
+                   if m.guid == "guid.src_noauth")
+        check(sna.author == "Unknown", "DB author=Unknown（不再是空串）")
+        report = svc.sync_from_disk(ModLocation.GAME)
+        check(not any(i.guid == "guid.src_noauth" for i in report.updated),
+              "安装落库后同步无作者抖动")
+
+        # ── 用例 14：manifest 有作者 → 目录名不覆盖作者 ────────
+        print("[14] manifest 有作者 → 作者不被所在目录名覆盖")
+        mdir = game / "Mallory"
+        mdir.mkdir(exist_ok=True)
+        make_zipmod(mdir, "Authored", "guid.authored", author="Alice")
+        svc.sync_from_disk(ModLocation.GAME)
+        svc.session.expire_all()
+        am = next(m for m in query_mods(svc, ModLocation.GAME)
+                  if m.guid == "guid.authored")
+        check(am.author == "Alice", "author 保持 manifest 值 Alice")
+        svc.sync_from_disk(ModLocation.GAME)
+        svc.session.expire_all()
+        am = next(m for m in query_mods(svc, ModLocation.GAME)
+                  if m.guid == "guid.authored")
+        check(am.author == "Alice", "二次同步 author 仍为 Alice（无抖动）")
 
         print(f"\nALL SYNC TESTS PASSED ({_passed} assertions)")

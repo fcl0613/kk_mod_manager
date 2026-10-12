@@ -12,14 +12,26 @@ KK Mod Manager is a PyQt6 desktop GUI for managing Sideloader `.zipmod` files fo
 # Install dependencies
 pip install -r requirements.txt
 
+# Install dev/test dependencies (includes pytest)
+pip install -r requirements-dev.txt
+
 # Run the app (development)
 python main.py
+
+# Run the test suite
+.venv/Scripts/python.exe -m pytest
 
 # Package to .exe
 pyinstaller KKModManager.spec
 ```
 
-There is no test runner configured. The single test file (`tests/card_service_test.py`) has hardcoded local paths and is run manually: `python tests/card_service_test.py`.
+### Testing
+
+pytest is configured in `pyproject.toml` (`[tool.pytest.ini_options]`). `python_files = ["test_*.py"]` is load-bearing: the default pattern also matches the three legacy manual scripts (`tests/*_test.py`), which must stay out of pytest collection.
+
+- `tests/test_*.py` + `tests/conftest.py` — the real suite (services, utils, models, card parsing). Fixtures provide in-memory SQLite, tmp game/repo dirs, and an **autouse swap of `app.config._config_instance`** so no test ever touches real `data/` paths; zipmod/card fixtures are generated at runtime (`.gitignore` excludes `*.zipmod` and `data/`).
+- `tests/sync_service_test.py` — manual script covering `sync_from_disk` (14 scenarios, run directly with `python tests/sync_service_test.py`); intentionally not migrated to pytest. `sync_from_disk`/`refresh_from_disk` are covered there, not in the pytest suite.
+- `tests/card_service_test.py`, `tests/scene_service_test.py` — exploratory scratch scripts with hardcoded local paths and no assertions; they exercise no project code (there is no SceneService).
 
 ## Architecture
 

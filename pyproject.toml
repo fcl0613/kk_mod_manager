@@ -18,3 +18,13 @@ kk-mod-manager = "main:main"
 [build-system]
 requires = ["setuptools>=69.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# 只收集 test_*.py：默认模式含 *_test.py，会把手动脚本
+# sync_service_test.py / card_service_test.py / scene_service_test.py 收进来
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+pythonpath = ["."]
+addopts = "-ra"

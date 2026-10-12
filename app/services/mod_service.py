@@ -12,6 +12,7 @@
   - 双重检测（游戏+仓库）防止重复
 """
 
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -93,6 +94,51 @@ class BatchInstallResult:
     def failures(self) -> list[BatchItemResult]:
         """返回所有失败项"""
         return [i for i in self.items if i.status == BatchItemStatus.FAILED]
+
+
+# ═══════════════════════════════════════════════════════════
+# 磁盘同步相关数据类（Sync）
+# ═══════════════════════════════════════════════════════════
+
+
+@dataclass
+class SyncChangeItem:
+    """磁盘同步单项变更明细"""
+    action: str            # "added" / "removed" / "updated" / "parse_failed"
+    guid: str
+    name: str
+    file_name: str
+    detail: str = ""       # 如 "v1.0.0 → v2.0.0"、"文件已消失"、"状态: 启用→禁用"
+
+
+@dataclass
+class SyncReport:
+    """单位置磁盘同步报告"""
+    location: ModLocation = ModLocation.GAME
+    scanned: int = 0                       # 磁盘扫描到的 zipmod 文件数（含禁用）
+    db_before: int = 0                     # 同步前该位置 DB 记录数
+    added: list[SyncChangeItem] = field(default_factory=list)
+    removed: list[SyncChangeItem] = field(default_factory=list)
+    updated: list[SyncChangeItem] = field(default_factory=list)
+    parse_failures: list[SyncChangeItem] = field(default_factory=list)
+    skipped: bool = False                  # 路径未配置 / 目录不存在
+    message: str = ""                      # skipped 原因
+
+    @property
+    def change_count(self) -> int:
+        """新增 + 删除 + 更新总数"""
+        return len(self.added) + len(self.removed) + len(self.updated)
+
+    def summary(self) -> str:
+        """一行中文摘要（供 UI / 操作日志使用）"""
+        if self.skipped:
+            return f"[{self.location.value}] 跳过：{self.message}"
+        label = "游戏" if self.location == ModLocation.GAME else "仓库"
+        return (
+            f"[{label}] 扫描 {self.scanned} | 新增 {len(self.added)} | "
+            f"删除 {len(self.removed)} | 更新 {len(self.updated)} | "
+            f"解析失败 {len(self.parse_failures)}"
+        )
 
 
 class ModService:
@@ -1004,6 +1050,277 @@ class ModService:
 
         self.session.commit()
         return count
+
+    def sync_from_disk(
+        self,
+        location: ModLocation,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> SyncReport:
+        """以磁盘为准增量同步数据库（不改动磁盘文件）。
+
+        与 refresh_from_disk 的区别：
+          - 增量 diff 而非清空重建，保留 notes / installed_at
+          - 扫描 .zipmod 与 .zipmod_disabled，按后缀同步禁用状态
+          - 记录 OperationLog 摘要
+
+        Args:
+            location: 同步位置（GAME / REPO）
+            progress_callback: 进度回调 (当前序号, 总数, 文件名)
+
+        Returns:
+            SyncReport 同步报告
+        """
+        report = SyncReport(location=location)
+
+        config = get_config()
+        if location == ModLocation.GAME:
+            base_str, label = config.game_mod_path, "游戏 Mod 路径"
+        else:
+            base_str, label = config.repo_path, "仓库路径"
+        if not base_str:
+            report.skipped = True
+            report.message = f"未配置{label}"
+            return report
+        base_path = Path(base_str)
+        if not base_path.exists():
+            report.skipped = True
+            report.message = f"{label}不存在：{base_str}"
+            return report
+
+        # ── 阶段 1：扫描磁盘，解析 manifest ──────────────────
+        disk_files = sorted(
+            f for f in base_path.rglob("*")
+            if f.is_file() and f.suffix.lower() in (".zipmod", ".zipmod_disabled")
+        )
+        report.scanned = len(disk_files)
+
+        disk_by_guid: dict[str, list[dict]] = {}
+        fail_paths: set[Path] = set()
+        for i, file_path in enumerate(disk_files):
+            if progress_callback:
+                progress_callback(i, len(disk_files), file_path.name)
+            try:
+                manifest = self.manifest_svc.parse_from_zipmod(file_path)
+            except ManifestParseError as e:
+                fail_paths.add(file_path)
+                report.parse_failures.append(SyncChangeItem(
+                    action="parse_failed", guid="", name=file_path.name,
+                    file_name=file_path.name, detail=str(e)[:200],
+                ))
+                continue
+            try:
+                mtime = file_path.stat().st_mtime
+            except OSError:
+                mtime = datetime.now().timestamp()
+            disk_by_guid.setdefault(manifest.guid, []).append({
+                "path": file_path,
+                "manifest": manifest,
+                "is_disabled": file_path.name.lower().endswith(".zipmod_disabled"),
+                "mtime": mtime,
+            })
+
+        # ── 阶段 2：加载 DB，清理同位置重复 GUID 的脏数据 ────
+        db_mods = self.session.query(Mod).filter(Mod.location == location).all()
+        report.db_before = len(db_mods)
+        db_by_guid: dict[str, Mod] = {}
+        for mod in db_mods:
+            if mod.guid in db_by_guid:
+                # 唯一索引外的历史脏数据：保留先出现的一条
+                self.session.delete(mod)
+                report.removed.append(SyncChangeItem(
+                    action="removed", guid=mod.guid, name=mod.name,
+                    file_name=mod.file_name, detail="清理重复记录",
+                ))
+            else:
+                db_by_guid[mod.guid] = mod
+
+        # ── 阶段 3：磁盘有 GUID → 新增或原地更新 ────────────
+        for guid, entries in disk_by_guid.items():
+            mod = db_by_guid.get(guid)
+
+            # 同 GUID 多文件：优先取 DB 推导路径所在文件，
+            # 否则启用态优先 + 路径字典序（保证确定性）；多余文件不动
+            chosen = None
+            if mod is not None:
+                expect = self._derive_mod_path(mod, base_path)
+                for entry in entries:
+                    if os.path.normcase(str(entry["path"])) == os.path.normcase(str(expect)):
+                        chosen = entry
+                        break
+            if chosen is None:
+                entries.sort(key=lambda e: (e["is_disabled"], str(e["path"])))
+                chosen = entries[0]
+
+            if mod is None:
+                manifest = chosen["manifest"]
+                author = manifest.author
+                if not author and chosen["path"].parent != base_path:
+                    # 文件在子目录中，用目录名推断作者（与 refresh_from_disk 一致）
+                    author = chosen["path"].parent.name
+                new_mod = Mod(
+                    guid=guid,
+                    name=manifest.name,
+                    version=manifest.version,
+                    author=author,
+                    author_normalized=(author.strip().lower() if author else "unknown"),
+                    description=manifest.description,
+                    website=manifest.website,
+                    file_name=chosen["path"].name,
+                    location=location,
+                    status=(
+                        ModStatus.DISABLED
+                        if chosen["is_disabled"] and location == ModLocation.GAME
+                        else ModStatus.ENABLED
+                    ),
+                    installed_at=datetime.fromtimestamp(chosen["mtime"]),
+                    repo_relative_path=(
+                        chosen["path"].relative_to(base_path).as_posix()
+                        if location == ModLocation.REPO else ""
+                    ),
+                )
+                self.session.add(new_mod)
+                report.added.append(SyncChangeItem(
+                    action="added", guid=guid, name=manifest.name,
+                    file_name=chosen["path"].name,
+                    detail=f"v{manifest.version} 作者 {author or 'Unknown'}",
+                ))
+            else:
+                item = self._apply_mod_update(
+                    mod, chosen["manifest"], chosen["path"], base_path, location,
+                )
+                if item is not None:
+                    report.updated.append(item)
+
+        # ── 阶段 4：DB 有、磁盘无该 GUID → 删除或保留 ────────
+        for guid, mod in db_by_guid.items():
+            if guid in disk_by_guid:
+                continue
+            expect = self._derive_mod_path(mod, base_path)
+            if expect.exists():
+                if expect in fail_paths:
+                    # 文件还在但解析失败（损坏 / 下载中），保留记录
+                    logger.warning("同步 - 文件解析失败，保留记录: {} ({})", expect.name, guid)
+                    continue
+                # 路径被其他 GUID 的文件占用 → 原地被替换，删旧记录（新 GUID 已在阶段 3 新增）
+                self.session.delete(mod)
+                report.removed.append(SyncChangeItem(
+                    action="removed", guid=guid, name=mod.name,
+                    file_name=mod.file_name, detail="文件被替换为其他 Mod",
+                ))
+            elif (
+                location == ModLocation.GAME
+                and any(
+                    fp.name.lower() == mod.current_file_name.lower()
+                    for fp in fail_paths
+                )
+            ):
+                # GAME 端路径是推导值（作者目录），文件可能实际在别处：
+                # 按文件名兜底匹配解析失败文件，避免误删
+                logger.warning(
+                    "同步 - 疑似解析失败，保留记录: {} ({})", mod.current_file_name, guid,
+                )
+            else:
+                # 文件已消失
+                self.session.delete(mod)
+                report.removed.append(SyncChangeItem(
+                    action="removed", guid=guid, name=mod.name,
+                    file_name=mod.file_name, detail="文件已消失",
+                ))
+
+        # ── 阶段 5：单事务提交（先 flush 删除，防御 INSERT 先于
+        #    DELETE 的 flush 顺序撞 (location, guid) 唯一索引）──
+        try:
+            self.session.flush()
+            self.session.commit()
+        except Exception as e:
+            self.session.rollback()
+            logger.error("磁盘同步失败({}): {}", location.value, e)
+            raise
+
+        if report.change_count or report.parse_failures:
+            self._log_operation(
+                operation="sync",
+                mod_name=f"(磁盘同步 {location.value})",
+                mod_guid="",
+                location=location.value,
+                detail=report.summary()[:450],
+            )
+            self.session.commit()
+
+        if progress_callback:
+            progress_callback(len(disk_files), len(disk_files), "完成")
+        logger.info("磁盘同步完成: {}", report.summary())
+        return report
+
+    @staticmethod
+    def _derive_mod_path(mod: Mod, base_path: Path) -> Path:
+        """推导 DB 记录对应的磁盘路径（与 _remove_mod_files 同一公式）"""
+        if mod.location == ModLocation.REPO:
+            return resolve_repo_mod_path(mod, base_path)
+        return get_author_dir(base_path, mod.author) / mod.current_file_name
+
+    def _apply_mod_update(
+        self,
+        mod: Mod,
+        manifest: ModManifest,
+        file_path: Path,
+        base_path: Path,
+        location: ModLocation,
+    ) -> SyncChangeItem | None:
+        """按磁盘实际情况原地更新已有记录（保留 notes / installed_at）。
+
+        file_name 沿用代码库约定：存磁盘实际文件名（禁用时含 _disabled 后缀，
+        与 set_enabled 行为一致）。
+
+        Returns:
+            有变化时返回变更明细，无变化返回 None
+        """
+        changes: list[str] = []
+        file_name = file_path.name
+        is_disabled = file_path.name.lower().endswith(".zipmod_disabled")
+
+        if mod.file_name != file_name:
+            changes.append(f"文件名 {mod.file_name} → {file_name}")
+            mod.file_name = file_name
+
+        if location == ModLocation.REPO:
+            rel = file_path.relative_to(base_path).as_posix()
+            if mod.repo_relative_path != rel:
+                changes.append(f"路径 {mod.repo_relative_path or '(空)'} → {rel}")
+                mod.repo_relative_path = rel  # 顺带回填老数据
+        else:
+            new_status = ModStatus.DISABLED if is_disabled else ModStatus.ENABLED
+            if mod.status != new_status:
+                old = "禁用" if mod.status == ModStatus.DISABLED else "启用"
+                new = "禁用" if new_status == ModStatus.DISABLED else "启用"
+                changes.append(f"状态 {old} → {new}")
+                mod.status = new_status
+
+        if mod.name != manifest.name:
+            changes.append(f"名称 {mod.name} → {manifest.name}")
+            mod.name = manifest.name
+        if mod.version != manifest.version:
+            changes.append(f"版本 v{mod.version} → v{manifest.version}")
+            mod.version = manifest.version
+        if (mod.description or "") != manifest.description:
+            changes.append("描述已更新")
+            mod.description = manifest.description
+        if (mod.website or "") != manifest.website:
+            changes.append("网站已更新")
+            mod.website = manifest.website
+
+        # author：仅当 manifest 有非空作者且忽略大小写不同才更新（避免大小写抖动）
+        if manifest.author and (mod.author or "").strip().lower() != manifest.author.strip().lower():
+            changes.append(f"作者 {mod.author or '(空)'} → {manifest.author}")
+            mod.author = manifest.author
+            mod.author_normalized = manifest.author_normalized
+
+        if not changes:
+            return None
+        return SyncChangeItem(
+            action="updated", guid=mod.guid, name=mod.name,
+            file_name=file_name, detail="；".join(changes),
+        )
 
     # ═══════════════════════════════════════════════════════════
     # 批量安装（Batch Install）

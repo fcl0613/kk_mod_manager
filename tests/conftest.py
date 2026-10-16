@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import msgpack
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -255,3 +256,91 @@ class FakeKCLoader:
     @staticmethod
     def load(path):
         return FakeKCLoader.payload
+
+
+# ═══════════════════════════════════════════════════════════
+# 场景卡构造器（与 scene_service 的解析契约对应）
+# ═══════════════════════════════════════════════════════════
+
+def make_scene_item_info(
+    guid: str, name: str = "", author: str = "", website: str = "",
+) -> bytes:
+    """构造场景级 UAR 物品/图案条目（msgpack dict：GUID/Name/Author/Website）"""
+    return msgpack.packb(
+        {"GUID": guid, "Name": name, "Author": author, "Website": website,
+         "Slot": 1, "LocalSlot": 100000001},
+        use_bin_type=True,
+    )
+
+
+def make_chara_uar_blob(
+    mod_id: str, name: str = "", author: str = "", website: str = "",
+) -> bytes:
+    """构造角色卡 UAR info 条目（msgpack dict：ModID 打头，Slot 次之）。
+
+    必须满足 parse_character_card 的字节级契约 info[8:find(b'\\xa4Slot')]：
+    ModID 键打头（0x8N 地图头 + 0xa5'ModID' 共 7 字节）且 GUID ≤ 31 字节
+    （fixstr 单字节头，数据从第 8 字节起），否则该字节 hack 会截错。
+    """
+    assert len(mod_id.encode("utf-8")) <= 31, "GUID 超过 31 字节会破坏 info[8:] 契约"
+    return msgpack.packb(
+        {"ModID": mod_id, "Slot": 100, "LocalSlot": 100000002,
+         "Property": "ChaFileFace.hlUpId", "CategoryNo": 410,
+         "Author": author, "Website": website, "Name": name},
+        use_bin_type=True,
+    )
+
+
+class StubScene:
+    """模拟 KoikatuSceneData：version/map/mod_data 属性 + walk/count_object_types。
+
+    walk 产出 (序号, {"type": 0, "data": {"character": StubKC}})，与真实
+    CHARACTER 对象嵌套结构一致（obj["data"]["character"] 为内嵌角色数据）。
+    """
+
+    CHARACTER = 0
+
+    def __init__(self, version="1.0.4.2", map_id=-1, mod_data=None,
+                 characters=None, counts=None):
+        self.version = version
+        self.map = map_id
+        self.mod_data = mod_data
+        self._characters = characters or []
+        self._counts = counts or {}
+
+    def walk(self, include_depth=False, object_type=None):
+        for i, kc in enumerate(self._characters):
+            yield i, {"type": 0, "data": {"character": kc}}
+
+    def count_object_types(self):
+        return dict(self._counts)
+
+
+class FakeSceneLoader:
+    """SceneService 加载桩：monkeypatch 到 scene_service.KoikatuSceneData，
+    .load(str(path)) 返回类属性 payload（用 fake_scene fixture 安装与清理）"""
+
+    payload = None
+    CHARACTER = 0
+
+    @staticmethod
+    def load(path):
+        return FakeSceneLoader.payload
+
+
+@pytest.fixture()
+def fake_scene(monkeypatch):
+    """monkeypatch scene_service.KoikatuSceneData 为 FakeSceneLoader。
+
+    用法：sd = fake_scene(StubScene(...)) —— 返回赋给 load 的桩对象，
+    测试结束后自动恢复原引用并清空 payload（仿 fake_kc 模式）。
+    """
+    from app.services import scene_service as ss
+
+    def _install(payload):
+        FakeSceneLoader.payload = payload
+        monkeypatch.setattr(ss, "KoikatuSceneData", FakeSceneLoader)
+        return payload
+
+    yield _install
+    FakeSceneLoader.payload = None

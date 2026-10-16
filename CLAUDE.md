@@ -31,7 +31,7 @@ pytest is configured in `pyproject.toml` (`[tool.pytest.ini_options]`). `python_
 
 - `tests/test_*.py` + `tests/conftest.py` — the real suite (services, utils, models, card parsing). Fixtures provide in-memory SQLite, tmp game/repo dirs, and an **autouse swap of `app.config._config_instance`** so no test ever touches real `data/` paths; zipmod/card fixtures are generated at runtime (`.gitignore` excludes `*.zipmod` and `data/`).
 - `tests/sync_service_test.py` — manual script covering `sync_from_disk` (14 scenarios, run directly with `python tests/sync_service_test.py`); intentionally not migrated to pytest. `sync_from_disk`/`refresh_from_disk` are covered there, not in the pytest suite.
-- `tests/card_service_test.py`, `tests/scene_service_test.py` — exploratory scratch scripts with hardcoded local paths and no assertions; they exercise no project code (there is no SceneService).
+- `tests/card_service_test.py`, `tests/scene_service_test.py`, `tests/_scene_explore.py` — exploratory scratch scripts with hardcoded local paths and no assertions; they stay untracked and out of pytest collection. The real scene-card tests live in `tests/test_scene_service.py`.
 
 ## Architecture
 
@@ -43,7 +43,7 @@ pytest is configured in `pyproject.toml` (`[tool.pytest.ini_options]`). `python_
 2. `MainWindow` calls `init_db()` (SQLAlchemy `create_all`), creates a `ModService` with a session from `get_session()`, and wires UI signals to service methods.
 3. All business operations go through `ModService` which takes a SQLAlchemy `Session` in its constructor — it handles parsing, duplicate detection, file copy/delete, DB writes, and operation logging in one transaction.
 4. `ManifestService` is stateless: `parse_from_zipmod(path)` reads `manifest.xml` from inside the zipmod, `check_duplicate()` queries DB for GUID+location conflicts with semantic version comparison via `packaging.version.Version`.
-5. `CardService` uses the third-party `kkloader` library to parse Koikatsu character cards and custom binary parsing for clothing cards. `check_mod_availability()` cross-references extracted GUIDs against the database.
+5. `CardService` uses the third-party `kkloader` library to parse Koikatsu character cards and custom binary parsing for clothing cards. Scene cards (detected by the 【KStudio】 marker after PNG IEND) are delegated to `SceneService.parse_scene()`, which merges scene-level Sideloader UAR dependencies (items/patterns/map/filter/ramp/BGM) with the deps of each embedded character. `check_mod_availability()` cross-references extracted GUIDs against the database.
 
 ### Key architectural rules
 

@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import (
     QStatusBar, QFileDialog, QMessageBox, QProgressDialog,
     QToolButton, QMenu,
 )
-from PyQt6.QtCore import Qt, QSize, QTimer
+from PyQt6.QtCore import Qt, QSize, QTimer, QThread
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QShortcut, QKeySequence
 from loguru import logger
 
@@ -35,6 +35,7 @@ from app.ui.card_result_dialog import CardResultDialog
 from app.ui.card_parse_page import CardParsePage
 from app.ui.batch_install_dialog import BatchInstallDialog
 from app.ui.sync_dialog import SyncDialog
+from app.ui.card_parse_worker import CardParseWorker
 
 
 class PendingAction(Enum):
@@ -65,6 +66,10 @@ class MainWindow(QMainWindow):
         init_db()
         self._mod_service = ModService(get_session())
         self._card_service = CardService()
+
+        # 卡片解析后台线程（F17-11；同一时刻仅一次解析）
+        self._card_parse_thread: QThread | None = None
+        self._card_parse_worker: CardParseWorker | None = None
 
         self._setup_ui()
         self._load_theme()
@@ -359,15 +364,34 @@ class MainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════
 
     def _parse_card(self, card_path: Path):
-        """解析角色卡/服装卡，并在卡片解析页面显示结果"""
+        """解析角色卡/服装卡/场景卡，后台线程执行并在卡片解析页面显示结果（F17-11）"""
+        if self._card_parse_thread is not None:
+            # 上一次解析仍在进行，忽略本次拖入（防重入）
+            self.status_bar.showMessage("正在解析上一张卡片，请稍候…", 3000)
+            return
+
         logger.info("开始解析卡片: {}", card_path)
         self.status_bar.showMessage(f"正在解析卡片：{card_path.name}...")
 
-        # 解析卡片
-        result = self._card_service.parse_card(card_path)
+        self._card_parse_thread = QThread(self)
+        self._card_parse_worker = CardParseWorker(self._card_service, card_path)
+        self._card_parse_worker.moveToThread(self._card_parse_thread)
+        self._card_parse_thread.started.connect(self._card_parse_worker.run)
+        self._card_parse_worker.progress.connect(self._on_card_parse_progress)
+        self._card_parse_worker.finished.connect(self._on_card_parse_finished)
+        self._card_parse_worker.error.connect(self._on_card_parse_error)
+        self._card_parse_thread.start()
+
+    def _on_card_parse_progress(self, done: int, total: int):
+        """解析进度：状态栏显示已处理内嵌角色数（仅场景卡触发）"""
+        self.status_bar.showMessage(f"解析场景中：已处理角色 {done}/{total}...")
+
+    def _on_card_parse_finished(self, result: CardParseResult):
+        """解析完成：展示结果或友好错误（F17-12）"""
+        self._dispose_card_parse_thread()
 
         if not result.is_valid:
-            logger.warning("卡片解析失败: {} - {}", card_path.name, result.error_message)
+            logger.warning("卡片解析失败: {} - {}", result.card_path.name, result.error_message)
             QMessageBox.warning(
                 self,
                 "卡片解析失败",
@@ -376,16 +400,10 @@ class MainWindow(QMainWindow):
             self.status_bar.clearMessage()
             # 重置卡片页拖放区（避免一直显示"解析中..."）
             self.card_page.drop_zone.setText(
-                "🎴 拖入角色卡/服装卡 (PNG) 进行 Mod 依赖分析"
+                "🎴 拖入角色卡/服装卡/场景卡 (PNG) 进行 Mod 依赖分析"
             )
             self.card_page.stats_label.setText("拖入 PNG 卡片开始解析")
             return
-
-        # 检查 Mod 可用性
-        self._card_service.check_mod_availability(
-            result,
-            self._mod_service.session,
-        )
 
         self._card_result = result
 
@@ -395,7 +413,7 @@ class MainWindow(QMainWindow):
 
         logger.info(
             "卡片解析完成: {} - 总计={} 已安装={} 仓库有={} 缺失={}",
-            card_path.name,
+            result.card_path.name,
             result.total_count, result.installed_count,
             result.in_repo_count, result.missing_count,
         )
@@ -405,6 +423,25 @@ class MainWindow(QMainWindow):
             f"仓库有 {result.in_repo_count} | "
             f"缺失 {result.missing_count}"
         )
+
+    def _on_card_parse_error(self, message: str):
+        """后台线程未预期异常"""
+        self._dispose_card_parse_thread()
+        logger.error("卡片解析线程异常: {}", message)
+        QMessageBox.critical(self, "解析出错", f"解析卡片时发生未预期的错误：\n{message}")
+        self.status_bar.clearMessage()
+        self.card_page.drop_zone.setText(
+            "🎴 拖入角色卡/服装卡/场景卡 (PNG) 进行 Mod 依赖分析"
+        )
+        self.card_page.stats_label.setText("拖入 PNG 卡片开始解析")
+
+    def _dispose_card_parse_thread(self):
+        """回收解析线程与 worker（finished/error 到达时 run() 已近尾声）"""
+        thread, self._card_parse_thread = self._card_parse_thread, None
+        self._card_parse_worker = None
+        if thread is not None:
+            thread.quit()
+            thread.wait(2000)
 
     def _parse_card_and_show_dialog(self, card_path: Path):
         """解析卡片并在对话框中显示（保留旧接口兼容）"""

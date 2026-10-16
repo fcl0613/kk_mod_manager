@@ -18,9 +18,11 @@ from PyQt6.QtGui import QPixmap, QDragEnterEvent, QDropEvent
 from loguru import logger
 
 from app.services.card_service import (
+    CardModItem,
     CardParseResult,
     CardModStatus,
     GameVersion,
+    SceneSummary,
 )
 
 
@@ -77,7 +79,7 @@ class CardParsePage(QWidget):
         top_bar = QHBoxLayout()
         top_bar.setSpacing(8)
 
-        self.drop_zone = QLabel("🎴 拖入角色卡/服装卡 (PNG) 进行 Mod 依赖分析")
+        self.drop_zone = QLabel("🎴 拖入角色卡/服装卡/场景卡 (PNG) 进行 Mod 依赖分析")
         self.drop_zone.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.drop_zone.setMinimumHeight(60)
         self.drop_zone.setMaximumHeight(80)
@@ -124,6 +126,13 @@ class CardParsePage(QWidget):
         self.game_version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.game_version_label.setObjectName("cardTypeLabel")
         left_panel.addWidget(self.game_version_label)
+
+        # 场景摘要标签（仅场景卡显示，F17-2）
+        self.scene_summary_label = QLabel("")
+        self.scene_summary_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.scene_summary_label.setObjectName("cardTypeLabel")
+        self.scene_summary_label.setWordWrap(True)
+        left_panel.addWidget(self.scene_summary_label)
 
         # 转为 KK 卡按钮（仅二代卡显示）
         self.convert_to_kk_btn = QPushButton("转为 KK 卡")
@@ -193,11 +202,15 @@ class CardParsePage(QWidget):
             self.drop_zone.setStyleSheet("")
             self.image_label.setStyleSheet("")
             self.card_type_label.setStyleSheet("")
+            self.game_version_label.setStyleSheet("")
+            self.scene_summary_label.setStyleSheet("")
         else:
             # 亮色主题：设置可见边框
             self.drop_zone.setStyleSheet(self.LIGHT_DROP_ZONE_STYLE)
             self.image_label.setStyleSheet(self.LIGHT_IMAGE_STYLE)
             self.card_type_label.setStyleSheet(self.LIGHT_CARD_TYPE_STYLE)
+            self.game_version_label.setStyleSheet(self.LIGHT_CARD_TYPE_STYLE)
+            self.scene_summary_label.setStyleSheet(self.LIGHT_CARD_TYPE_STYLE)
 
     # ═══════════════════════════════════════════════════════
     # 拖放处理
@@ -265,7 +278,7 @@ class CardParsePage(QWidget):
         """点击选择卡片按钮"""
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "选择角色卡/服装卡",
+            "选择角色卡/服装卡/场景卡",
             "",
             "PNG 文件 (*.png);;所有文件 (*.*)",
         )
@@ -292,11 +305,13 @@ class CardParsePage(QWidget):
         self.card_name_label.setText("")
         self.card_type_label.setText("")
         self.game_version_label.setText("")
+        self.scene_summary_label.setText("")
+        self.scene_summary_label.setToolTip("")
         self.convert_to_kk_btn.setVisible(False)
         self.stats_label.setText("拖入 PNG 卡片开始解析")
         self.install_all_btn.setVisible(False)
         self.copy_missing_btn.setVisible(False)
-        self.drop_zone.setText("🎴 拖入角色卡/服装卡 (PNG) 进行 Mod 依赖分析")
+        self.drop_zone.setText("🎴 拖入角色卡/服装卡/场景卡 (PNG) 进行 Mod 依赖分析")
 
     # ═══════════════════════════════════════════════════════
     # 数据填充
@@ -323,14 +338,32 @@ class CardParsePage(QWidget):
         # 卡片类型
         self.card_type_label.setText(f"类型：{self._result.card_type}")
 
-        # 游戏版本
-        if self._result.game_version == GameVersion.KK:
+        # 场景摘要 / 游戏版本
+        summary = self._result.scene_summary
+        if summary is not None:
+            # 场景卡：左列显示摘要；不提供转卡（F17-12），
+            # KK/KKS 线索取自首个成功解析的内嵌角色
+            self.convert_to_kk_btn.setVisible(False)
+            if summary.game_version is not None:
+                self.game_version_label.setText(
+                    "游戏：" + ("KK" if summary.game_version == GameVersion.KK else "KKS")
+                )
+            else:
+                self.game_version_label.setText("")
+            self._fill_scene_summary(summary)
+        elif self._result.game_version == GameVersion.KK:
+            self.scene_summary_label.setText("")
+            self.scene_summary_label.setToolTip("")
             self.game_version_label.setText("游戏：KK")
             self.convert_to_kk_btn.setVisible(False)
         elif self._result.game_version == GameVersion.KKS:
+            self.scene_summary_label.setText("")
+            self.scene_summary_label.setToolTip("")
             self.game_version_label.setText("游戏：KKS")
             self.convert_to_kk_btn.setVisible(True)
         else:
+            self.scene_summary_label.setText("")
+            self.scene_summary_label.setToolTip("")
             self.game_version_label.setText("")
             self.convert_to_kk_btn.setVisible(False)
 
@@ -355,6 +388,9 @@ class CardParsePage(QWidget):
             )
             for item in installed:
                 info = f"{item.mod_author}/{item.mod_name} v{item.mod_version}"
+                tags = self._source_tags(item)
+                if tags:
+                    info += f" {tags}"
                 self._add_item(group, item.guid, info, "🟢 已安装", "")
 
         # 🟡 仓库有分组
@@ -365,6 +401,9 @@ class CardParsePage(QWidget):
             )
             for item in in_repo:
                 info = f"{item.mod_author}/{item.mod_name} v{item.mod_version}"
+                tags = self._source_tags(item)
+                if tags:
+                    info += f" {tags}"
                 self._add_item(
                     group, item.guid, info, "🟡 仓库有", "安装",
                     mod_id=item.mod_id,
@@ -377,7 +416,14 @@ class CardParsePage(QWidget):
                 self.MISSING_COLOR,
             )
             for item in missing:
-                self._add_item(group, item.guid, "", "🔴 缺失", "")
+                # 缺失行展示卡内 UAR 元数据（Name · Author · Website）作为下载线索（F17-7）
+                info = " · ".join(filter(None, [
+                    item.meta_name, item.meta_author, item.meta_website,
+                ]))
+                tags = self._source_tags(item)
+                if tags:
+                    info = f"{info} {tags}".strip()
+                self._add_item(group, item.guid, info, "🔴 缺失", "")
 
         self.tree.expandAll()
 
@@ -387,6 +433,33 @@ class CardParsePage(QWidget):
         # 按钮可见性
         self.install_all_btn.setVisible(len(in_repo) > 0)
         self.copy_missing_btn.setVisible(len(missing) > 0)
+
+    def _fill_scene_summary(self, s: SceneSummary):
+        """填充场景摘要（版本/角色/物品/地图/Timeline，F17-2）"""
+        lines = [
+            f"版本：{s.version}" if s.version else "版本：未知",
+            f"角色：{s.character_count}  物品：{s.item_count}",
+        ]
+        if s.map_id != -1:
+            lines.append(f"地图 ID：{s.map_id}")
+        if s.has_timeline:
+            lines.append("🎬 Timeline 动画")
+        if s.skipped_characters:
+            lines.append(f"⚠ {len(s.skipped_characters)} 个角色解析失败")
+        self.scene_summary_label.setText("\n".join(lines))
+
+        # tooltip：完整角色名单 + 被跳过的角色（BR-C08）
+        tooltip_parts = []
+        if s.character_names:
+            tooltip_parts.append("角色名单：\n" + "\n".join(s.character_names))
+        if s.skipped_characters:
+            tooltip_parts.append("解析失败（已跳过）：\n" + "\n".join(s.skipped_characters))
+        self.scene_summary_label.setToolTip("\n\n".join(tooltip_parts))
+
+    @staticmethod
+    def _source_tags(item: CardModItem) -> str:
+        """依赖来源标签文本（场景卡专用；普通卡 sources 为空返回空串，Q-06）"""
+        return " ".join(f"[{src}]" for src in item.sources)
 
     def _load_card_image(self):
         """加载卡片 PNG 图片预览"""
@@ -487,7 +560,12 @@ class CardParsePage(QWidget):
             QMessageBox.information(self, "提示", "没有缺失的 Mod")
             return
 
-        text = "\n".join(m.guid for m in missing)
+        # 带元数据的行输出 "GUID（Name · Author · Website）"，便于按图索骥找 Mod（F17-7）
+        lines = []
+        for m in missing:
+            meta = " · ".join(filter(None, [m.meta_name, m.meta_author, m.meta_website]))
+            lines.append(f"{m.guid}（{meta}）" if meta else m.guid)
+        text = "\n".join(lines)
         clipboard = QApplication.clipboard()
         clipboard.setText(text)
 

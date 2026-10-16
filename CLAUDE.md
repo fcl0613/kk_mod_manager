@@ -47,10 +47,11 @@ pytest is configured in `pyproject.toml` (`[tool.pytest.ini_options]`). `python_
 
 ### Key architectural rules
 
-- **`.zipmod` files are never unzipped.** Installing a mod = copying the `.zipmod` file into `{game_path}/{AuthorName}/`. Removing = deleting the file.
+- **`.zipmod` files are never unzipped.** Installing a mod = copying the `.zipmod` file into `{game_path}/{Category}/{AuthorName}/` (F19 category routing, on by default; falls back to `{game_path}/{AuthorName}/` when disabled). Removing = deleting the file. The repo side stays flat: `{repo_path}/{AuthorName}/`.
 - **Enable/disable is a rename operation**: `.zipmod` ↔ `.zipmod_disabled` (applies only to GAME-location mods).
 - **Same GUID can have two rows** in the `mods` table — one with `location=GAME`, one with `location=REPO`. The composite unique index is `(location, guid)`.
-- **Author directory matching is case-insensitive**: `get_author_dir()` searches existing directories case-insensitively before creating new ones.
+- **Author directory matching is case-insensitive**: `get_author_dir()` searches existing directories case-insensitively before creating new ones. Category dirs reuse the same matcher (F19); category names are reserved — never inferred as author names during disk sync.
+- **File location is relative-path-first** (F19): GAME rows persist `game_relative_path`, REPO rows `repo_relative_path`; both fall back to author-dir derivation when empty. The basename is always swapped for `current_file_name` so enable/disable renames resolve in both directions.
 - **Version comparison** uses `packaging.version.Version`; unparseable versions fall through to `UNKNOWN_VERSION` (conservative — asks user).
 
 ### SQLAlchemy sessions

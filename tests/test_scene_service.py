@@ -8,6 +8,7 @@ from pathlib import Path
 from app.services import scene_service
 from app.services.card_service import (
     SCENE_KEY,
+    STUDIO_SOURCE_TAGS,
     CardParseResult,
     CardService,
     GameVersion,
@@ -381,3 +382,50 @@ class TestMergeGuid:
         assert m.meta_name == "CN"  # 空位回填
         assert m.meta_author == "SA"  # 已有值不被覆盖
         assert m.meta_website == "CW"
+
+
+# ═══════════════════════════════════════════════════════════
+# 依赖粗分类型推导（F17-13）
+# ═══════════════════════════════════════════════════════════
+
+class TestDepTypeIntegration:
+    def test_dep_type_from_parse_sources(self, fake_scene):
+        """解析产物 sources → dep_type 三态：工作室 / 角色 / 角色+工作室"""
+        kc = StubKC({
+            "Parameter": {"nickname": "雪", "version": "0.0.5"},
+            "KKEx": {UAR_KEY: [0, {"info": [make_chara_uar_blob("both.mod")]}]},
+        })
+        mod_data = {UAR_KEY: [0, {
+            "itemInfo": [make_scene_item_info("both.mod"),
+                         make_scene_item_info("studio.mod")],
+            "mapInfoGUID": "map.mod",
+        }]}
+        fake_scene(StubScene(mod_data=mod_data, characters=[kc]))
+
+        r = SceneService.parse_scene(Path("s.png"))
+        by = {m.guid: m for m in r.mods}
+        assert by["both.mod"].dep_type == "角色+工作室"   # 场景物品 + 内嵌角色
+        assert by["studio.mod"].dep_type == "工作室"      # 仅场景物品
+        assert by["map.mod"].dep_type == "工作室"         # 地图
+        assert by["both.mod"].sources[0] == "场景物品"
+        assert by["both.mod"].sources[1].startswith("角色: ")
+
+    def test_chara_only_dep_type(self, fake_scene):
+        """仅内嵌角色来源 → 角色"""
+        kc = StubKC({
+            "Parameter": {"nickname": "雪", "version": "0.0.5"},
+            "KKEx": {UAR_KEY: [0, {"info": [make_chara_uar_blob("koux.mod")]}]},
+        })
+        fake_scene(StubScene(characters=[kc]))
+        r = SceneService.parse_scene(Path("s.png"))
+        assert r.mods[0].dep_type == "角色"
+
+    def test_studio_source_tags_consistency_guard(self):
+        """守护：STUDIO_SOURCE_TAGS 必须与 scene_service 的来源标签集合一致。
+
+        新增 LIST_DEPS/STRING_DEPS 标签时须同步 card_service.STUDIO_SOURCE_TAGS，
+        否则 dep_type 会把新标签误判为"角色"。
+        """
+        labels = {label for _, label in scene_service.LIST_DEPS}
+        labels |= {label for _, label in scene_service.STRING_DEPS}
+        assert STUDIO_SOURCE_TAGS == frozenset(labels)

@@ -17,6 +17,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QSize
 from PyQt6.QtGui import QPixmap, QDragEnterEvent, QDropEvent
 from loguru import logger
 
+from app.config import get_config
 from app.services.card_service import (
     CardModItem,
     CardParseResult,
@@ -29,8 +30,8 @@ from app.services.card_service import (
 class CardParsePage(QWidget):
     """卡片解析页面"""
 
-    # 信号：请求安装某个仓库中的 Mod
-    install_mod_requested = pyqtSignal(int)  # mod_id
+    # 信号：请求安装某个仓库中的 Mod（mod_id, 目标分类；F17-13/F19-10）
+    install_mod_requested = pyqtSignal(int, str)
     # 信号：请求重新解析当前卡片
     reparse_requested = pyqtSignal()
     # 信号：新卡片拖入/选择，请求解析
@@ -406,7 +407,7 @@ class CardParsePage(QWidget):
                     info += f" {tags}"
                 self._add_item(
                     group, item.guid, info, "🟡 仓库有", "安装",
-                    mod_id=item.mod_id,
+                    card_item=item,
                 )
 
         # 🔴 缺失分组
@@ -458,8 +459,27 @@ class CardParsePage(QWidget):
 
     @staticmethod
     def _source_tags(item: CardModItem) -> str:
-        """依赖来源标签文本（场景卡专用；普通卡 sources 为空返回空串，Q-06）"""
-        return " ".join(f"[{src}]" for src in item.sources)
+        """依赖来源标签文本（场景卡专用；普通卡 sources 为空返回空串，Q-06）。
+
+        场景卡来源前带粗分类型标注【角色】/【工作室】/【角色+工作室】（F17-13）。
+        """
+        if not item.sources:
+            return ""
+        return f"【{item.dep_type}】 " + " ".join(f"[{src}]" for src in item.sources)
+
+    @staticmethod
+    def _target_category(item: CardModItem) -> str:
+        """按依赖粗分类型路由安装目标分类（F19-10）。
+
+        分类开关关 → ""（平铺旧公式）；【工作室】→ category_studio；
+        其余（角色 / 角色+工作室 / 空来源）→ category_chara。
+        """
+        config = get_config()
+        if not config.category.game_category_enabled:
+            return ""
+        if item.dep_type == "工作室":
+            return config.category.category_studio
+        return config.category.category_chara
 
     def _load_card_image(self):
         """加载卡片 PNG 图片预览"""
@@ -497,7 +517,7 @@ class CardParsePage(QWidget):
         mod_info: str,
         status_text: str,
         action_text: str,
-        mod_id: int | None = None,
+        card_item: CardModItem | None = None,
     ):
         """添加 Mod 行（列序: GUID | Mod名称 | 状态 | 操作）"""
         item = QTreeWidgetItem(parent)
@@ -506,8 +526,8 @@ class CardParsePage(QWidget):
         item.setText(2, status_text)
         item.setText(3, "")
 
-        # 操作列：嵌入安装按钮
-        if action_text == "安装" and mod_id is not None:
+        # 操作列：嵌入安装按钮（按依赖粗分路由目标分类，F17-13）
+        if action_text == "安装" and card_item is not None and card_item.mod_id is not None:
             btn = QPushButton("安装")
             btn.setFixedSize(60, 24)
             btn.setStyleSheet(
@@ -516,7 +536,7 @@ class CardParsePage(QWidget):
                 "QPushButton:hover { background-color: #94e2d5; }"
             )
             btn.clicked.connect(
-                lambda checked, mid=mod_id: self._on_install_one(mid)
+                lambda checked, it=card_item: self._on_install_one(it)
             )
             self.tree.setItemWidget(item, 3, btn)
 
@@ -524,12 +544,14 @@ class CardParsePage(QWidget):
     # 操作回调
     # ═══════════════════════════════════════════════════════
 
-    def _on_install_one(self, mod_id: int):
-        """单个安装按钮 — 发射信号给 MainWindow 处理"""
-        self.install_mod_requested.emit(mod_id)
+    def _on_install_one(self, card_item: CardModItem):
+        """单个安装按钮 — 按依赖粗分路由目标分类后发射信号（F17-13）"""
+        self.install_mod_requested.emit(
+            card_item.mod_id, self._target_category(card_item)
+        )
 
     def _on_install_all(self):
-        """全部安装按钮"""
+        """全部安装按钮（逐条按各自粗分类型路由，F17-13）"""
         if self._result is None:
             return
         reply = QMessageBox.question(
@@ -544,7 +566,9 @@ class CardParsePage(QWidget):
         in_repo = [m for m in self._result.mods
                    if m.status == CardModStatus.IN_REPO and m.mod_id is not None]
         for item in in_repo:
-            self.install_mod_requested.emit(item.mod_id)
+            self.install_mod_requested.emit(
+                item.mod_id, self._target_category(item)
+            )
 
         # 请求 MainWindow 重新解析卡片
         self.reparse_requested.emit()

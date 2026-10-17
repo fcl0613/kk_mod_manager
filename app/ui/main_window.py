@@ -517,14 +517,14 @@ class MainWindow(QMainWindow):
     # 卡片解析页面信号回调
     # ═══════════════════════════════════════════════════════
 
-    def _on_card_page_install(self, mod_id: int):
-        """卡片解析页：安装单个 Mod"""
+    def _on_card_page_install(self, mod_id: int, category: str = ""):
+        """卡片解析页：安装单个 Mod（category 为按依赖粗分路由的目标分类，F17-13）"""
         mod = self._mod_service.get_mod_by_id(mod_id)
         name = mod.name if mod else f"ID={mod_id}"
-        logger.info("卡片页安装请求: {} (ID={})", name, mod_id)
+        logger.info("卡片页安装请求: {} (ID={}, 分类={})", name, mod_id, category or "平铺")
         self.status_bar.showMessage(f"正在从仓库安装：{name}...")
 
-        success, msg = self.install_repo_mod(mod_id)
+        success, msg = self.install_repo_mod(mod_id, category=category or None)
         QMessageBox.information(self, "安装结果", msg)
 
         if success:

@@ -41,6 +41,13 @@ NAME_END_BYTES = b"\x28\x00\x00\xDF\x12\x00\x00"  # 卡片名结束标志
 STOP_TAG = b"<additionalAccessories"
 SCENE_KEY = "【KStudio】".encode("utf-8")  # 场景卡尾部标识（BR-C05）
 
+# 依赖来源标签 → 粗分类型（F17-13）。
+# 角色类来源：内嵌角色依赖的来源前缀（scene_service 拼接 "角色: 昵称"）；
+# 工作室类来源：场景级 UAR 依赖标签（与 scene_service.LIST_DEPS/STRING_DEPS 一致，
+# 由 tests/test_scene_service.py 一致性守护测试兜底）。
+CHARA_SOURCE_PREFIX = "角色: "
+STUDIO_SOURCE_TAGS = frozenset({"场景物品", "场景图案", "地图", "滤镜", "Ramp", "BGM"})
+
 
 class CardModStatus(Enum):
     """卡片中依赖 Mod 的可用性状态"""
@@ -89,6 +96,22 @@ class CardModItem:
             CardModStatus.MISSING: "缺失",
         }
         return texts[self.status]
+
+    @property
+    def dep_type(self) -> str:
+        """依赖粗分类型（F17-13）：角色 / 工作室 / 角色+工作室。
+
+        由来源标签推导：含 "角色: " 前缀来源 → 角色；含工作室标签 → 工作室；
+        两者皆有 → 角色+工作室。空来源（人物/服装卡）按卡片视角归"角色"
+        （F19-3：无场景上下文的角色类依赖统一落角色分类）。
+        """
+        has_chara = any(s.startswith(CHARA_SOURCE_PREFIX) for s in self.sources)
+        has_studio = any(s in STUDIO_SOURCE_TAGS for s in self.sources)
+        if has_chara and has_studio:
+            return "角色+工作室"
+        if has_studio:
+            return "工作室"
+        return "角色"
 
 
 class GameVersion(Enum):

@@ -10,11 +10,14 @@ import pytest
 
 from app.models.mod import Mod, ModLocation, ModStatus
 from app.services.card_service import (
+    CHARA_SOURCE_PREFIX,
     CHECK_KEY,
+    CardModItem,
     CardModStatus,
     CardParseResult,
     CardService,
     GameVersion,
+    STUDIO_SOURCE_TAGS,
 )
 from tests.conftest import (
     UAR_KEY,
@@ -329,3 +332,26 @@ class TestCheckModAvailability:
         result = card_svc.check_mod_availability(_result_with([]), db_session)
         assert (result.total_count, result.installed_count,
                 result.in_repo_count, result.missing_count) == (0, 0, 0, 0)
+
+
+# ═══════════════════════════════════════════════════════════
+# 依赖粗分类型（F17-13）
+# ═══════════════════════════════════════════════════════════
+
+class TestDepType:
+    @staticmethod
+    def _item(sources: list[str]) -> CardModItem:
+        return CardModItem(guid="g", status=CardModStatus.MISSING, sources=sources)
+
+    def test_empty_sources_is_chara(self):
+        """空来源（人物/服装卡）→ 角色（F19-3 卡片视角）"""
+        assert self._item([]).dep_type == "角色"
+
+    def test_chara_sources_only(self):
+        assert self._item(["角色: 雪", "角色: 角色3"]).dep_type == "角色"
+
+    def test_studio_sources_only(self):
+        assert self._item(["场景物品", "地图"]).dep_type == "工作室"
+
+    def test_mixed_sources(self):
+        assert self._item(["场景物品", "角色: 雪"]).dep_type == "角色+工作室"

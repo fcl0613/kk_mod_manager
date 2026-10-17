@@ -21,6 +21,7 @@ from kkloader import KoikatuSceneData
 from loguru import logger
 
 from app.services.card_service import (
+    CHARA_SOURCE_PREFIX,
     CardModItem,
     CardModStatus,
     CardParseResult,
@@ -217,7 +218,7 @@ class SceneService:
                             continue
                         name, author, website = meta_map.get(guid, ("", "", ""))
                         SceneService._merge_guid(
-                            merged, guid, f"角色: {nickname}",
+                            merged, guid, f"{CHARA_SOURCE_PREFIX}{nickname}",
                             meta=(name, author, website),
                         )
                     summary.character_names.append(nickname)

@@ -12,6 +12,8 @@ from pathlib import Path, PurePosixPath
 import shutil
 import os
 
+from app.utils.version_utils import display_version
+
 
 def ensure_dir(path: Path) -> Path:
     """确保目录存在，不存在则创建"""
@@ -56,15 +58,17 @@ def safe_copy(
         shutil.copy2(src, target)
         return target
 
-    # 同名文件已存在 → 用版本号重命名
-    new_name = f"{stem}v{version}{suffix}"
+    # 同名文件已存在 → 用版本号重命名（display_version 保证前缀唯一，
+    # 版本号自带 v 前缀时不会出现 "vv" 文件名）
+    v = display_version(version)
+    new_name = f"{stem}{v}{suffix}"
     target = dst_dir / new_name
 
     # 仍冲突 → 追加序号
     if target.exists():
         counter = 1
         while True:
-            new_name = f"{stem}v{version}_{counter}{suffix}"
+            new_name = f"{stem}{v}_{counter}{suffix}"
             target = dst_dir / new_name
             if not target.exists():
                 break

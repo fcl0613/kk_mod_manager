@@ -18,6 +18,7 @@ from PyQt6.QtGui import QPixmap, QDragEnterEvent, QDropEvent
 from loguru import logger
 
 from app.config import get_config
+from app.utils.version_utils import display_version
 from app.services.card_service import (
     CardModItem,
     CardParseResult,
@@ -388,7 +389,7 @@ class CardParsePage(QWidget):
                 self.INSTALLED_COLOR,
             )
             for item in installed:
-                info = f"{item.mod_author}/{item.mod_name} v{item.mod_version}"
+                info = f"{item.mod_author}/{item.mod_name} {display_version(item.mod_version)}"
                 tags = self._source_tags(item)
                 if tags:
                     info += f" {tags}"
@@ -401,7 +402,7 @@ class CardParsePage(QWidget):
                 self.IN_REPO_COLOR,
             )
             for item in in_repo:
-                info = f"{item.mod_author}/{item.mod_name} v{item.mod_version}"
+                info = f"{item.mod_author}/{item.mod_name} {display_version(item.mod_version)}"
                 tags = self._source_tags(item)
                 if tags:
                     info += f" {tags}"

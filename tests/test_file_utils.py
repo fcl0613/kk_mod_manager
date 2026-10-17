@@ -57,6 +57,15 @@ def test_safe_copy_conflict_renames_with_version(tmp_path):
     assert result.read_text(encoding="utf-8") == "new"
 
 
+def test_safe_copy_v_prefixed_version_no_double_v(tmp_path):
+    """manifest 版本自带 v 前缀 → 改名文件不出现 "vv"（display_version 归一）"""
+    src = _touch(tmp_path / "src" / "ModA.zipmod", "new")
+    dst_dir = tmp_path / "dst"
+    _touch(dst_dir / "ModA.zipmod", "old")
+    result = safe_copy(src, dst_dir, "ModA.zipmod", "v2.0.0")
+    assert result.name == "ModAv2.0.0.zipmod"
+
+
 def test_safe_copy_conflict_counter_chain(tmp_path):
     src = _touch(tmp_path / "src" / "ModA.zipmod", "new")
     dst_dir = tmp_path / "dst"

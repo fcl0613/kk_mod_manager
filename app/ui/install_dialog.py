@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 
 from app.config import describe_category, get_config
+from app.utils.version_utils import display_version
 from app.services.manifest_service import (
     ModManifest,
     DuplicateReport,
@@ -145,18 +146,20 @@ class InstallConfirmDialog(QDialog):
         if self.dup_report.result == DuplicateResult.SAME_VERSION:
             self._add_field(
                 info_layout, "版本",
-                f"{self.dup_report.existing_version}（已安装）= "
-                f"{self.dup_report.incoming_version}（当前）"
+                f"{display_version(self.dup_report.existing_version)}（已安装）= "
+                f"{display_version(self.dup_report.incoming_version)}（当前）"
             )
             hint = QLabel("无需重复安装。")
             hint.setObjectName("subtitle")
             info_layout.addWidget(hint)
         else:
             self._add_field(
-                info_layout, "已安装版本", self.dup_report.existing_version
+                info_layout, "已安装版本",
+                display_version(self.dup_report.existing_version),
             )
             self._add_field(
-                info_layout, "待安装版本", self.dup_report.incoming_version
+                info_layout, "待安装版本",
+                display_version(self.dup_report.incoming_version),
             )
 
             if self.dup_report.result == DuplicateResult.NEWER_VERSION:

@@ -24,6 +24,7 @@ from app.services.card_service import (
     CardParseResult,
     CardModStatus,
 )
+from app.utils.version_utils import display_version
 
 
 class CardResultDialog(QDialog):
@@ -163,7 +164,7 @@ class CardResultDialog(QDialog):
                 self._add_item(
                     group,
                     "已安装",
-                    f"{item.mod_author}/{item.mod_name} v{item.mod_version}",
+                    f"{item.mod_author}/{item.mod_name} {display_version(item.mod_version)}",
                     item.guid,
                     "",
                 )
@@ -177,7 +178,7 @@ class CardResultDialog(QDialog):
                 self._add_item(
                     group,
                     "仓库有",
-                    f"{item.mod_author}/{item.mod_name} v{item.mod_version}",
+                    f"{item.mod_author}/{item.mod_name} {display_version(item.mod_version)}",
                     item.guid,
                     "安装",
                     item.mod_id,

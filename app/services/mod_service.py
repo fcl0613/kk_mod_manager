@@ -44,6 +44,7 @@ from app.utils.file_utils import (
     resolve_game_mod_path,
     infer_author_from_path,
 )
+from app.utils.version_utils import display_version
 
 
 @dataclass
@@ -233,11 +234,11 @@ class ModService:
         )
 
         if dup.is_blocked:
-            logger.info("安装被阻止（同版本已存在）: {} v{}", manifest.name, manifest.version)
+            logger.info("安装被阻止（同版本已存在）: {} v{}", manifest.name, display_version(manifest.version))
             return InstallResult(
                 success=False,
                 message=(
-                    f"已安装相同版本的 Mod：{manifest.name} v{manifest.version}\n"
+                    f"已安装相同版本的 Mod：{manifest.name} {display_version(manifest.version)}\n"
                     f"GUID: {manifest.guid}"
                 ),
                 duplicate_report=dup,
@@ -246,7 +247,7 @@ class ModService:
 
         if dup.needs_confirmation:
             if dup.result == DuplicateResult.NEWER_VERSION and not confirm_upgrade:
-                logger.info("需要确认升级: {} v{} → v{}", manifest.name, dup.existing_version, manifest.version)
+                logger.info("需要确认升级: {} v{} → v{}", manifest.name, display_version(dup.existing_version), display_version(manifest.version))
                 return InstallResult(
                     success=False,
                     message="NEWER_VERSION_NEEDS_CONFIRM",
@@ -254,7 +255,7 @@ class ModService:
                     manifest=manifest,
                 )
             if dup.result == DuplicateResult.OLDER_VERSION and not confirm_downgrade:
-                logger.info("需要确认降级: {} v{} → v{}", manifest.name, dup.existing_version, manifest.version)
+                logger.info("需要确认降级: {} v{} → v{}", manifest.name, display_version(dup.existing_version), display_version(manifest.version))
                 return InstallResult(
                     success=False,
                     message="OLDER_VERSION_NEEDS_CONFIRM",
@@ -264,7 +265,7 @@ class ModService:
 
         # 4. 如果有旧版本，先删除
         if dup.existing_mod is not None:
-            logger.info("移除旧版本: {} v{} (GUID={})", manifest.name, dup.existing_version, manifest.guid)
+            logger.info("移除旧版本: {} v{} (GUID={})", manifest.name, display_version(dup.existing_version), manifest.guid)
             self._remove_mod_files(dup.existing_mod, config.game_mod_path)
             self.session.delete(dup.existing_mod)
             self.session.flush()
@@ -312,14 +313,14 @@ class ModService:
             mod_name=manifest.name,
             mod_guid=manifest.guid,
             location="game",
-            detail=f"安装 v{manifest.version} → {dest_file}",
+            detail=f"安装 {display_version(manifest.version)} → {dest_file}",
         )
 
         self.session.commit()
 
         return InstallResult(
             success=True,
-            message=f"安装成功：{manifest.name} v{manifest.version}",
+            message=f"安装成功：{manifest.name} {display_version(manifest.version)}",
             mod=mod,
             manifest=manifest,
         )
@@ -371,10 +372,10 @@ class ModService:
         )
 
         if dup.is_blocked:
-            logger.info("添加到仓库被阻止（同版本已存在）: {} v{}", manifest.name, manifest.version)
+            logger.info("添加到仓库被阻止（同版本已存在）: {} v{}", manifest.name, display_version(manifest.version))
             return InstallResult(
                 success=False,
-                message=f"仓库中已存在相同版本的 Mod：{manifest.name} v{manifest.version}",
+                message=f"仓库中已存在相同版本的 Mod：{manifest.name} {display_version(manifest.version)}",
                 duplicate_report=dup,
                 manifest=manifest,
             )
@@ -443,14 +444,14 @@ class ModService:
             mod_name=manifest.name,
             mod_guid=manifest.guid,
             location="repo",
-            detail=f"添加 v{manifest.version} → {dest_file}",
+            detail=f"添加 {display_version(manifest.version)} → {dest_file}",
         )
 
         self.session.commit()
 
         return InstallResult(
             success=True,
-            message=f"已添加到仓库：{manifest.name} v{manifest.version}",
+            message=f"已添加到仓库：{manifest.name} {display_version(manifest.version)}",
             mod=mod,
             manifest=manifest,
         )
@@ -492,7 +493,7 @@ class ModService:
         if game_result.success:
             game_result.message = (
                 f"安装并收藏成功：{game_result.manifest.name} "
-                f"v{game_result.manifest.version}"
+                f"{display_version(game_result.manifest.version)}"
             )
         return game_result
 
@@ -679,13 +680,13 @@ class ModService:
         )
         if game_dup is not None:
             if game_dup.version == repo_mod.version:
-                logger.info("从仓库安装被跳过（游戏已安装同版本）: {} v{}", repo_mod.name, repo_mod.version)
+                logger.info("从仓库安装被跳过（游戏已安装同版本）: {} v{}", repo_mod.name, display_version(repo_mod.version))
                 return InstallResult(
                     success=False,
-                    message=f"游戏已安装相同版本：{repo_mod.name} v{repo_mod.version}",
+                    message=f"游戏已安装相同版本：{repo_mod.name} {display_version(repo_mod.version)}",
                 )
             # 版本不同 → 当作升级处理
-            logger.info("从仓库安装 - 移除游戏旧版本: {} v{}", game_dup.name, game_dup.version)
+            logger.info("从仓库安装 - 移除游戏旧版本: {} v{}", game_dup.name, display_version(game_dup.version))
             self._remove_mod_files(game_dup, config.game_mod_path)
             self.session.delete(game_dup)
             self.session.flush()
@@ -711,7 +712,7 @@ class ModService:
                 file_name=src_file.name,
                 version=repo_mod.version,
             )
-            logger.info("从仓库安装成功: {} v{} → {}", repo_mod.name, repo_mod.version, dest_file)
+            logger.info("从仓库安装成功: {} v{} → {}", repo_mod.name, display_version(repo_mod.version), dest_file)
         except OSError as e:
             logger.error("从仓库安装文件复制失败: {} - {}", src_file.name, e)
             return InstallResult(
@@ -740,14 +741,14 @@ class ModService:
             mod_name=repo_mod.name,
             mod_guid=repo_mod.guid,
             location="game",
-            detail=f"从仓库安装 v{repo_mod.version}",
+            detail=f"从仓库安装 {display_version(repo_mod.version)}",
         )
 
         self.session.commit()
 
         return InstallResult(
             success=True,
-            message=f"已安装到游戏：{repo_mod.name} v{repo_mod.version}",
+            message=f"已安装到游戏：{repo_mod.name} {display_version(repo_mod.version)}",
             mod=game_mod,
         )
 
@@ -790,13 +791,13 @@ class ModService:
         )
         if repo_dup is not None:
             if repo_dup.version == game_mod.version:
-                logger.info("添加到仓库被跳过（仓库已存在同版本）: {} v{}", game_mod.name, game_mod.version)
+                logger.info("添加到仓库被跳过（仓库已存在同版本）: {} v{}", game_mod.name, display_version(game_mod.version))
                 return InstallResult(
                     success=False,
-                    message=f"仓库中已存在相同版本：{game_mod.name} v{game_mod.version}",
+                    message=f"仓库中已存在相同版本：{game_mod.name} {display_version(game_mod.version)}",
                 )
             # 版本不同 → 移除仓库旧版本
-            logger.info("添加到仓库 - 移除仓库旧版本: {} v{}", repo_dup.name, repo_dup.version)
+            logger.info("添加到仓库 - 移除仓库旧版本: {} v{}", repo_dup.name, display_version(repo_dup.version))
             self._remove_mod_files(repo_dup, config.repo_path)
             self.session.delete(repo_dup)
             self.session.flush()
@@ -822,7 +823,7 @@ class ModService:
                 file_name=src_file.name,
                 version=game_mod.version,
             )
-            logger.info("添加到仓库成功: {} v{} → {}", game_mod.name, game_mod.version, dest_file)
+            logger.info("添加到仓库成功: {} v{} → {}", game_mod.name, display_version(game_mod.version), dest_file)
         except OSError as e:
             logger.error("添加到仓库文件复制失败: {} - {}", src_file.name, e)
             return InstallResult(
@@ -851,14 +852,14 @@ class ModService:
             mod_name=game_mod.name,
             mod_guid=game_mod.guid,
             location="repo",
-            detail=f"从游戏添加 v{game_mod.version}",
+            detail=f"从游戏添加 {display_version(game_mod.version)}",
         )
 
         self.session.commit()
 
         return InstallResult(
             success=True,
-            message=f"已加入仓库：{game_mod.name} v{game_mod.version}",
+            message=f"已加入仓库：{game_mod.name} {display_version(game_mod.version)}",
             mod=repo_mod,
         )
 
@@ -1237,7 +1238,7 @@ class ModService:
                 report.added.append(SyncChangeItem(
                     action="added", guid=guid, name=manifest.name,
                     file_name=chosen["path"].name,
-                    detail=f"v{manifest.version} 作者 {author}",
+                    detail=f"{display_version(manifest.version)} 作者 {author}",
                 ))
             else:
                 item = self._apply_mod_update(
@@ -1359,7 +1360,7 @@ class ModService:
             changes.append(f"名称 {mod.name} → {manifest.name}")
             mod.name = manifest.name
         if mod.version != manifest.version:
-            changes.append(f"版本 v{mod.version} → v{manifest.version}")
+            changes.append(f"版本 {display_version(mod.version)} → {display_version(manifest.version)}")
             mod.version = manifest.version
         if (mod.description or "") != manifest.description:
             changes.append("描述已更新")
@@ -1543,11 +1544,11 @@ class ModService:
 
         if dup.is_blocked:
             # 同版本已存在，跳过
-            logger.debug("批量安装 - 跳过（同版本）: {} v{}", manifest.name, manifest.version)
+            logger.debug("批量安装 - 跳过（同版本）: {} v{}", manifest.name, display_version(manifest.version))
             return BatchItemResult(
                 file_path=fp,
                 status=BatchItemStatus.SKIPPED,
-                message=f"已存在相同版本：{manifest.name} v{manifest.version}",
+                message=f"已存在相同版本：{manifest.name} {display_version(manifest.version)}",
                 manifest=manifest,
                 duplicate_report=dup,
             )
@@ -1556,14 +1557,15 @@ class ModService:
             # 版本不同，记录为冲突，不自动处理
             logger.debug(
                 "批量安装 - 版本冲突: {} 已有=v{} 待装=v{}",
-                manifest.name, dup.existing_version, manifest.version,
+                manifest.name, display_version(dup.existing_version),
+                display_version(manifest.version),
             )
             return BatchItemResult(
                 file_path=fp,
                 status=BatchItemStatus.CONFLICT,
                 message=(
-                    f"版本冲突：已有 v{dup.existing_version}，"
-                    f"待添加 v{manifest.version}"
+                    f"版本冲突：已有 {display_version(dup.existing_version)}，"
+                    f"待添加 {display_version(manifest.version)}"
                 ),
                 manifest=manifest,
                 duplicate_report=dup,
@@ -1629,15 +1631,15 @@ class ModService:
             mod_name=manifest.name,
             mod_guid=manifest.guid,
             location=loc_label,
-            detail=f"批量添加 v{manifest.version} → {dest_file}",
+            detail=f"批量添加 {display_version(manifest.version)} → {dest_file}",
         )
         self.session.commit()
 
-        logger.debug("批量安装 - 成功: {} v{}", manifest.name, manifest.version)
+        logger.debug("批量安装 - 成功: {} v{}", manifest.name, display_version(manifest.version))
         return BatchItemResult(
             file_path=fp,
             status=BatchItemStatus.SUCCESS,
-            message=f"成功：{manifest.name} v{manifest.version}",
+            message=f"成功：{manifest.name} {display_version(manifest.version)}",
             manifest=manifest,
         )
 

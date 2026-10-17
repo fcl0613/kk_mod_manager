@@ -76,6 +76,16 @@ class TestInstallToGame:
         assert mod.status is ModStatus.ENABLED
         assert db_session.query(OperationLog).filter_by(operation="install").count() == 1
 
+    def test_install_message_with_v_prefixed_version(self, svc, dirs):
+        """manifest 版本自带 v 前缀 → 消息展示不出现 "vv"（display_version 归一）"""
+        src = make_zipmod(dirs.root / "src", "ModA", "guid.v", version="v2.1.0",
+                          author="Alice")
+        res = svc.install_to_game(src)
+
+        assert res.success
+        assert res.message == "安装成功：ModA v2.1.0"
+        assert res.mod.version == "v2.1.0"  # 落库保持 manifest 原值
+
     def test_reuses_author_dir_case_insensitive(self, svc, dirs):
         (dirs.game / "ALICE").mkdir()
         src = make_zipmod(dirs.root / "src", "ModA", "guid.a", author="Alice")

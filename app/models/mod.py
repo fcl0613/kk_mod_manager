@@ -13,6 +13,7 @@ from sqlalchemy import String, Enum, DateTime, Index
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+from app.utils.version_utils import display_version
 
 
 class ModLocation(PyEnum):
@@ -88,7 +89,7 @@ class Mod(Base):
     def __repr__(self) -> str:
         return (
             f"<Mod(id={self.id}, guid='{self.guid}', name='{self.name}', "
-            f"v{self.version}, location={self.location.value}, "
+            f"{display_version(self.version)}, location={self.location.value}, "
             f"status={self.status.value})>"
         )
 

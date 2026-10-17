@@ -36,6 +36,7 @@ from app.ui.card_parse_page import CardParsePage
 from app.ui.batch_install_dialog import BatchInstallDialog
 from app.ui.sync_dialog import SyncDialog
 from app.ui.card_parse_worker import CardParseWorker
+from app.utils.version_utils import display_version
 
 
 class PendingAction(Enum):
@@ -940,7 +941,7 @@ class MainWindow(QMainWindow):
             for mod in mods:
                 item = QTreeWidgetItem(group)
                 item.setText(0, mod.name)
-                item.setText(1, f"v{mod.version}")
+                item.setText(1, display_version(mod.version))
 
                 if mod.location == ModLocation.GAME:
                     status_text = "✅" if mod.status == ModStatus.ENABLED else "⛔"

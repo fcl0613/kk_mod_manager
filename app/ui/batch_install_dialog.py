@@ -20,6 +20,7 @@ from PyQt6.QtGui import QColor
 
 from app.config import describe_category
 from app.models.mod import ModLocation
+from app.utils.version_utils import display_version
 from app.services.mod_service import (
     ModService,
     BatchInstallResult,
@@ -412,15 +413,15 @@ class BatchInstallDialog(QDialog):
 
             if item.status == BatchItemStatus.SKIPPED:
                 dup = item.duplicate_report
-                tree_item.setText(2, dup.existing_version if dup else "—")
-                tree_item.setText(3, dup.incoming_version if dup else "—")
+                tree_item.setText(2, display_version(dup.existing_version) if dup else "—")
+                tree_item.setText(3, display_version(dup.incoming_version) if dup else "—")
                 tree_item.setText(4, "⏭ 已跳过")
                 tree_item.setForeground(4, QColor("#a6adc8"))
 
             elif item.status == BatchItemStatus.CONFLICT:
                 dup = item.duplicate_report
-                existing_v = dup.existing_version if dup else "—"
-                incoming_v = dup.incoming_version if dup else "—"
+                existing_v = display_version(dup.existing_version) if dup else "—"
+                incoming_v = display_version(dup.incoming_version) if dup else "—"
                 tree_item.setText(2, existing_v)
                 tree_item.setText(3, incoming_v)
 

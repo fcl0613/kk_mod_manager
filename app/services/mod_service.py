@@ -263,14 +263,8 @@ class ModService:
                     manifest=manifest,
                 )
 
-        # 4. 如果有旧版本，先删除
-        if dup.existing_mod is not None:
-            logger.info("移除旧版本: {} v{} (GUID={})", manifest.name, display_version(dup.existing_version), manifest.guid)
-            self._remove_mod_files(dup.existing_mod, config.game_mod_path)
-            self.session.delete(dup.existing_mod)
-            self.session.flush()
-
-        # 5. 复制文件到目标目录（F19 分类布局）
+        # 4. 复制文件到目标目录（F19 分类布局）
+        #    F04-8: 先复制成功、再删旧版本 —— 复制失败时旧 Mod 完整保留
         target_dir = self._game_target_dir(game_root, category, manifest.author)
         logger.debug("安装目标目录: {}", target_dir)
 
@@ -289,6 +283,13 @@ class ModService:
                 message=f"文件复制失败：{e}",
                 manifest=manifest,
             )
+
+        # 5. 复制成功后移除旧版本（升级/降级）
+        if dup.existing_mod is not None:
+            logger.info("移除旧版本: {} v{} (GUID={})", manifest.name, display_version(dup.existing_version), manifest.guid)
+            self._remove_mod_files(dup.existing_mod, config.game_mod_path)
+            self.session.delete(dup.existing_mod)
+            self.session.flush()
 
         # 6. 数据库记录（持久化 game_relative_path，F19-6）
         mod = Mod(
@@ -396,13 +397,7 @@ class ModService:
                     manifest=manifest,
                 )
 
-        # 4. 移除旧版本
-        if dup.existing_mod is not None:
-            self._remove_mod_files(dup.existing_mod, config.repo_path)
-            self.session.delete(dup.existing_mod)
-            self.session.flush()
-
-        # 5. 复制
+        # 4. 复制（F04-8: 先复制成功、再删旧版本，失败时旧 Mod 完整保留）
         author_dir = get_author_dir(repo_root, manifest.author)
         logger.debug("仓库目标目录: {}", author_dir)
 
@@ -421,6 +416,12 @@ class ModService:
                 message=f"文件复制失败：{e}",
                 manifest=manifest,
             )
+
+        # 5. 复制成功后移除旧版本（升级/降级）
+        if dup.existing_mod is not None:
+            self._remove_mod_files(dup.existing_mod, config.repo_path)
+            self.session.delete(dup.existing_mod)
+            self.session.flush()
 
         # 6. 数据库
         mod = Mod(
@@ -678,20 +679,14 @@ class ModService:
             )
             .first()
         )
-        if game_dup is not None:
-            if game_dup.version == repo_mod.version:
-                logger.info("从仓库安装被跳过（游戏已安装同版本）: {} v{}", repo_mod.name, display_version(repo_mod.version))
-                return InstallResult(
-                    success=False,
-                    message=f"游戏已安装相同版本：{repo_mod.name} {display_version(repo_mod.version)}",
-                )
-            # 版本不同 → 当作升级处理
-            logger.info("从仓库安装 - 移除游戏旧版本: {} v{}", game_dup.name, display_version(game_dup.version))
-            self._remove_mod_files(game_dup, config.game_mod_path)
-            self.session.delete(game_dup)
-            self.session.flush()
+        if game_dup is not None and game_dup.version == repo_mod.version:
+            logger.info("从仓库安装被跳过（游戏已安装同版本）: {} v{}", repo_mod.name, display_version(repo_mod.version))
+            return InstallResult(
+                success=False,
+                message=f"游戏已安装相同版本：{repo_mod.name} {display_version(repo_mod.version)}",
+            )
 
-        # 从仓库复制到游戏
+        # 从仓库复制到游戏（F04-8: 先复制成功、再删游戏旧版本，失败时旧 Mod 完整保留）
         repo_path = Path(config.repo_path)
         game_path = Path(config.game_mod_path)
         src_file = resolve_repo_mod_path(repo_mod, repo_path)
@@ -719,6 +714,13 @@ class ModService:
                 success=False,
                 message=f"文件复制失败：{e}",
             )
+
+        # 复制成功后移除游戏旧版本（升级）
+        if game_dup is not None:
+            logger.info("从仓库安装 - 移除游戏旧版本: {} v{}", game_dup.name, display_version(game_dup.version))
+            self._remove_mod_files(game_dup, config.game_mod_path)
+            self.session.delete(game_dup)
+            self.session.flush()
 
         game_mod = Mod(
             guid=repo_mod.guid,
@@ -789,20 +791,15 @@ class ModService:
             )
             .first()
         )
-        if repo_dup is not None:
-            if repo_dup.version == game_mod.version:
-                logger.info("添加到仓库被跳过（仓库已存在同版本）: {} v{}", game_mod.name, display_version(game_mod.version))
-                return InstallResult(
-                    success=False,
-                    message=f"仓库中已存在相同版本：{game_mod.name} {display_version(game_mod.version)}",
-                )
-            # 版本不同 → 移除仓库旧版本
-            logger.info("添加到仓库 - 移除仓库旧版本: {} v{}", repo_dup.name, display_version(repo_dup.version))
-            self._remove_mod_files(repo_dup, config.repo_path)
-            self.session.delete(repo_dup)
-            self.session.flush()
+        if repo_dup is not None and repo_dup.version == game_mod.version:
+            logger.info("添加到仓库被跳过（仓库已存在同版本）: {} v{}", game_mod.name, display_version(game_mod.version))
+            return InstallResult(
+                success=False,
+                message=f"仓库中已存在相同版本：{game_mod.name} {display_version(game_mod.version)}",
+            )
 
         # 从游戏复制到仓库（源定位走 game_relative_path 优先，F19-6）
+        # F04-8: 先复制成功、再删仓库旧版本，失败时旧 Mod 完整保留
         game_path = Path(config.game_mod_path)
         repo_path = Path(config.repo_path)
         src_file = resolve_game_mod_path(game_mod, game_path)
@@ -830,6 +827,13 @@ class ModService:
                 success=False,
                 message=f"文件复制失败：{e}",
             )
+
+        # 复制成功后移除仓库旧版本（升级）
+        if repo_dup is not None:
+            logger.info("添加到仓库 - 移除仓库旧版本: {} v{}", repo_dup.name, display_version(repo_dup.version))
+            self._remove_mod_files(repo_dup, config.repo_path)
+            self.session.delete(repo_dup)
+            self.session.flush()
 
         repo_mod = Mod(
             guid=game_mod.guid,
@@ -1571,15 +1575,8 @@ class ModService:
                 duplicate_report=dup,
             )
 
-        # 3. 移除旧版本（正常情况不会到这里，但防御性处理）
-        if dup.existing_mod is not None:
-            config = get_config()
-            base_str = config.game_mod_path if location == ModLocation.GAME else config.repo_path
-            self._remove_mod_files(dup.existing_mod, base_str)
-            self.session.delete(dup.existing_mod)
-            self.session.flush()
-
-        # 4. 复制文件（GAME 端按 F19 分类布局）
+        # 3. 复制文件（GAME 端按 F19 分类布局）
+        #    F04-8: 先复制成功、再删旧版本（正常情况不会有旧版本，防御性处理）
         if location == ModLocation.GAME:
             author_dir = self._game_target_dir(base_path, category, manifest.author)
         else:
@@ -1599,6 +1596,12 @@ class ModService:
                 message=f"文件复制失败：{e}",
                 manifest=manifest,
             )
+
+        # 4. 复制成功后移除旧版本（防御性）
+        if dup.existing_mod is not None:
+            self._remove_mod_files(dup.existing_mod, base_path)
+            self.session.delete(dup.existing_mod)
+            self.session.flush()
 
         # 5. 写入数据库
         mod = Mod(

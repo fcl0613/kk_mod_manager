@@ -52,6 +52,11 @@ def files_under(root: Path) -> set[str]:
     return {f.relative_to(root).as_posix() for f in root.rglob("*") if f.is_file()}
 
 
+def _copy_boom(src, dst_dir, file_name, version):
+    """模拟复制失败（磁盘满/权限等），F04-8 防丢测试用"""
+    raise OSError("simulated copy failure")
+
+
 # ═══════════════════════════════════════════════════════════
 # install_to_game
 # ═══════════════════════════════════════════════════════════
@@ -162,7 +167,24 @@ class TestInstallToGame:
         res = svc.install_to_game(v2, confirm_upgrade=True)
         assert res.success
         assert svc.get_game_mod_by_guid("guid.a").version == "2.0.0"
-        assert files_under(dirs.game) == {"Alice/ModA.zipmod"}  # 旧文件已删，仍只一份
+        # F04-8 先复制后删旧 → 新文件按 BR-F05 带版本号命名，旧文件已删仍只一份
+        assert files_under(dirs.game) == {"Alice/ModAv2.0.0.zipmod"}
+        assert svc.get_mods_count(ModLocation.GAME) == 1
+
+    def test_upgrade_copy_failure_keeps_old_mod(self, svc, dirs, monkeypatch):
+        """F04-8: 升级时复制失败 → 旧 Mod 的文件与数据库记录必须完整保留"""
+        v1 = make_zipmod(dirs.root / "v1", "ModA", "guid.a", version="1.0.0", author="Alice")
+        assert svc.install_to_game(v1).success
+        v2 = make_zipmod(dirs.root / "v2", "ModA", "guid.a", version="2.0.0", author="Alice")
+
+        monkeypatch.setattr("app.services.mod_service.safe_copy", _copy_boom)
+        res = svc.install_to_game(v2, confirm_upgrade=True)
+
+        assert not res.success
+        assert "文件复制失败" in res.message
+        # 旧文件未删、旧记录未动
+        assert files_under(dirs.game) == {"Alice/ModA.zipmod"}
+        assert svc.get_game_mod_by_guid("guid.a").version == "1.0.0"
         assert svc.get_mods_count(ModLocation.GAME) == 1
 
     def test_older_version_needs_confirm(self, svc, dirs):
@@ -514,7 +536,26 @@ class TestInstallFromRepo:
 
         assert res.success
         assert svc.get_game_mod_by_guid("guid.r").version == "2.0.0"
-        assert files_under(dirs.game) == {"Xavier/RepoMod.zipmod"}
+        # F04-8 先复制后删旧 → 升级文件按 BR-F05 带版本号命名
+        assert files_under(dirs.game) == {"Xavier/RepoModv2.0.0.zipmod"}
+
+    def test_upgrade_copy_failure_keeps_game_old(self, svc, dirs, monkeypatch):
+        """F04-8: 从仓库升级时复制失败 → 游戏旧 Mod 完整保留"""
+        v1 = make_zipmod(dirs.root / "v1", "RepoMod", "guid.r", version="1.0.0",
+                         author="Xavier")
+        repo_mod = svc.add_to_repo(v1).mod
+        assert svc.install_from_repo(repo_mod.id).success
+        v2 = make_zipmod(dirs.root / "v2", "RepoMod", "guid.r", version="2.0.0",
+                         author="Xavier")
+        new_repo_mod = svc.add_to_repo(v2, confirm_upgrade=True).mod
+
+        monkeypatch.setattr("app.services.mod_service.safe_copy", _copy_boom)
+        res = svc.install_from_repo(new_repo_mod.id)
+
+        assert not res.success
+        assert "文件复制失败" in res.message
+        assert files_under(dirs.game) == {"Xavier/RepoMod.zipmod"}  # 游戏旧版还在
+        assert svc.get_game_mod_by_guid("guid.r").version == "1.0.0"
 
     def test_game_mod_id_rejected(self, svc, dirs):
         src = make_zipmod(dirs.root / "src", "ModA", "guid.a", author="Alice")

@@ -4,6 +4,7 @@
   - F05-5: 选中 Mod 后右侧展示详情（GUID/描述/网站/完整路径）
   - F06-1/2: 卸载/移除按钮
   - F08-1/2: 启用/禁用按钮
+  - F12-1: zipmod 内缩略图展示（点击放大，见 ThumbnailService）
 """
 
 from pathlib import Path
@@ -13,11 +14,28 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QFrame, QScrollArea,
     QMessageBox,
 )
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QSize, pyqtSignal
+from PyQt6.QtGui import QCursor, QPixmap
 
 from app.models.mod import Mod, ModLocation, ModStatus
 from app.config import get_config
-from app.utils.file_utils import resolve_game_mod_path
+from app.services.thumbnail_service import ThumbnailService
+from app.ui.thumbnail_viewer_dialog import ThumbnailViewerDialog
+from app.utils.file_utils import (
+    resolve_game_mod_path,
+    resolve_repo_mod_path,
+)
+
+
+class ClickableLabel(QLabel):
+    """可点击的 QLabel（缩略图点击放大用）"""
+
+    clicked = pyqtSignal()
+
+    def mouseReleaseEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mouseReleaseEvent(ev)
 
 
 class ModDetailPanel(QWidget):
@@ -61,6 +79,19 @@ class ModDetailPanel(QWidget):
         content = QWidget()
         self.content_layout = QVBoxLayout(content)
         self.content_layout.setSpacing(8)
+
+        # 缩略图区域（F12-1：zipmod 内提取，无图时整体隐藏不占位）
+        self._thumb_service = ThumbnailService()
+        self._thumb_pixmap: QPixmap | None = None
+        self._thumb_entry: str = ""
+        self.thumbnail_label = ClickableLabel()
+        self.thumbnail_label.setObjectName("modThumbnail")
+        self.thumbnail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.thumbnail_label.setFixedHeight(220)
+        self.thumbnail_label.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.thumbnail_label.clicked.connect(self._show_thumbnail_viewer)
+        self.thumbnail_label.setVisible(False)
+        self.content_layout.addWidget(self.thumbnail_label)
 
         # 字段标签
         self.fields: dict[str, QLabel] = {}
@@ -158,12 +189,7 @@ class ModDetailPanel(QWidget):
         self.fields["installed_at"].setText(f"<b>安装时间：</b>{installed}")
 
         # 完整路径（GAME 端 rel path 优先定位，F19-6/9）
-        if mod.location == ModLocation.GAME:
-            full_path = str(resolve_game_mod_path(mod, Path(config.game_mod_path)))
-        elif mod.repo_relative_path:
-            full_path = f"{config.repo_path}/{mod.repo_relative_path}"
-        else:
-            full_path = f"{config.repo_path}/{mod.author or 'Unknown'}/{mod.current_file_name}"
+        full_path = str(self._resolve_mod_file_path(mod, config))
         self.fields["full_path"].setText(f"<b>完整路径：</b>{full_path}")
 
         # 仓库相对路径（仅 REPO 记录有意义）
@@ -209,6 +235,9 @@ class ModDetailPanel(QWidget):
         else:
             self.uninstall_btn.setText("从仓库移除")
 
+        # 缩略图（F12-1）
+        self._load_thumbnail(Path(full_path))
+
     def clear(self):
         """清空详情"""
         self._current_mod = None
@@ -221,6 +250,58 @@ class ModDetailPanel(QWidget):
         self.install_game_btn.setVisible(False)
         self.add_to_repo_btn.setVisible(False)
         self.uninstall_btn.setVisible(False)
+        # 缩略图（F12-1）
+        self._thumb_pixmap = None
+        self._thumb_entry = ""
+        self.thumbnail_label.setVisible(False)
+        self.thumbnail_label.setPixmap(QPixmap())   # 清掉旧图，避免残留
+
+    def _resolve_mod_file_path(self, mod: Mod, config) -> Path:
+        """解析 Mod 的 zipmod 文件实际路径（GAME/REPO 各自 rel path 优先，
+        回退作者目录定位；.zipmod_disabled 由 current_file_name 处理）"""
+        if mod.location == ModLocation.GAME:
+            return resolve_game_mod_path(mod, Path(config.game_mod_path))
+        return resolve_repo_mod_path(mod, Path(config.repo_path))
+
+    def _load_thumbnail(self, path: Path):
+        """加载并展示 zipmod 内缩略图（F12-1，best-effort，失败仅隐藏）"""
+        # 先重置，避免快速切换选中时残留上一张
+        self._thumb_pixmap = None
+        self._thumb_entry = ""
+        self.thumbnail_label.setPixmap(QPixmap())
+
+        thumb = self._thumb_service.extract(path)
+        if thumb is None:
+            self.thumbnail_label.setVisible(False)
+            return
+
+        pm = QPixmap()
+        if not pm.loadFromData(thumb.data) or pm.isNull():
+            # 解码失败（格式插件缺失等）→ 静默隐藏
+            self.thumbnail_label.setVisible(False)
+            return
+
+        self._thumb_pixmap = pm
+        self._thumb_entry = thumb.entry_name
+        # 固定缩放盒：show_mod 时 label 尚未布局，width() 不可靠
+        self.thumbnail_label.setPixmap(pm.scaled(
+            QSize(320, 208),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        ))
+        self.thumbnail_label.setVisible(True)
+
+    def _show_thumbnail_viewer(self):
+        """点击缩略图 → 大图查看器（原始分辨率）"""
+        if self._thumb_pixmap is None or self._thumb_pixmap.isNull():
+            return
+        mod_name = self._current_mod.name if self._current_mod else ""
+        ThumbnailViewerDialog(
+            self._thumb_pixmap,
+            entry_name=self._thumb_entry,
+            mod_name=mod_name,
+            parent=self,
+        ).exec()
 
     def _on_enable(self, enabled: bool):
         if self._current_mod is None:

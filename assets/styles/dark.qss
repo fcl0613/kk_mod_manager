@@ -249,6 +249,11 @@ QFrame#detailPanel {
     border: 1px solid #313244;
     border-radius: 4px;
 }
+QLabel#modThumbnail {
+    background-color: #11111b;
+    border: 1px solid #313244;
+    border-radius: 4px;
+}
 QGroupBox {
     font-weight: bold;
     border: 1px solid #313244;

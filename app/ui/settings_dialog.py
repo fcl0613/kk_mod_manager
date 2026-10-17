@@ -13,10 +13,10 @@ from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton, QCheckBox, QComboBox,
-    QGroupBox, QFormLayout, QFileDialog, QPlainTextEdit
+    QGroupBox, QFormLayout, QFileDialog, QPlainTextEdit, QLabel, QWidget
 )
 
-from app.config import get_config, save_config
+from app.config import describe_category, get_config, save_config
 
 
 class SettingsDialog(QDialog):
@@ -85,13 +85,25 @@ class SettingsDialog(QDialog):
         category_form = QFormLayout()
         category_form.addRow("分类目录清单:", self._make_categories_edit())
 
+        # 落点为可编辑下拉：编辑/保存的都是原始目录名，下方灰字仅作中文说明注记
         self.chara_category_combo = QComboBox()
         self.chara_category_combo.setEditable(True)
-        category_form.addRow("角色类分类落点:", self.chara_category_combo)
+        self.chara_category_hint = QLabel("")
+        category_form.addRow(
+            "角色类分类落点:",
+            self._wrap_category_combo(self.chara_category_combo, self.chara_category_hint),
+        )
 
         self.studio_category_combo = QComboBox()
         self.studio_category_combo.setEditable(True)
-        category_form.addRow("工作室类分类落点:", self.studio_category_combo)
+        self.studio_category_hint = QLabel("")
+        category_form.addRow(
+            "工作室类分类落点:",
+            self._wrap_category_combo(self.studio_category_combo, self.studio_category_hint),
+        )
+
+        for combo in (self.chara_category_combo, self.studio_category_combo):
+            combo.currentTextChanged.connect(lambda _: self._update_category_hints())
 
         category_layout.addLayout(category_form)
         layout.addWidget(category_group)
@@ -142,6 +154,28 @@ class SettingsDialog(QDialog):
         self.categories_edit.textChanged.connect(self._refresh_category_combos)
         return self.categories_edit
 
+    def _wrap_category_combo(self, combo: QComboBox, hint: QLabel) -> QWidget:
+        """下拉 + 中文说明灰字打包为表单行容器（说明仅展示，不影响编辑值）"""
+        hint.setStyleSheet("color: #888; font-size: 11px;")
+        box = QVBoxLayout()
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(2)
+        box.addWidget(combo)
+        box.addWidget(hint)
+        wrapper = QWidget()
+        wrapper.setLayout(box)
+        return wrapper
+
+    def _update_category_hints(self):
+        """刷新落点下拉下方的中文说明（已知分类才显示，自定义分类留空）"""
+        for combo, hint in (
+            (self.chara_category_combo, self.chara_category_hint),
+            (self.studio_category_combo, self.studio_category_hint),
+        ):
+            name = combo.currentText().strip()
+            desc = describe_category(name)
+            hint.setText(desc if name and desc != name else "")
+
     def _refresh_category_combos(self):
         """按清单刷新两个落点下拉的候选项（保留当前选择/自定义输入）"""
         names = self._category_names_from_edit()
@@ -152,6 +186,8 @@ class SettingsDialog(QDialog):
             combo.addItems(names)
             combo.setCurrentText(current)
             combo.blockSignals(False)
+        # blockSignals 期间 currentTextChanged 不触发，这里手动补一次
+        self._update_category_hints()
 
     def _category_names_from_edit(self) -> list[str]:
         seen: set[str] = set()

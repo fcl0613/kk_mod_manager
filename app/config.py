@@ -21,6 +21,25 @@ DEFAULT_GAME_CATEGORIES = (
     "ForStudioScenesLoading;KK_-ExclusivesAndUncensors;KK_-ExtraMaps;MyMods"
 )
 
+# 常见 Sideloader 分类目录的中文说明（仅展示层注记：
+# 目录创建/匹配/落盘一律用原始名，此表不参与任何逻辑判断）
+CATEGORY_DESCRIPTIONS = {
+    "AdditionalPoses": "追加姿势",
+    "BasisAndShaders": "基础与着色器",
+    "ForCharactersLoading": "角色加载用",
+    "ForStudioScenesLoading": "工作室场景加载用",
+    "KK_-ExclusivesAndUncensors": "KK 专属与去码",
+    "KK_-ExtraMaps": "KK 额外地图",
+    "MyMods": "我的 Mod",
+}
+
+
+def describe_category(name: str) -> str:
+    """分类目录名 → 追加中文说明的展示文本；未知/自定义分类原样返回"""
+    stripped = name.strip()
+    desc = CATEGORY_DESCRIPTIONS.get(stripped)
+    return f"{stripped}（{desc}）" if desc else name
+
 
 class CategoryConfig(BaseModel):
     """游戏分类目录安装配置（F19，需求文档 7.3）"""

@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 
-from app.config import get_config
+from app.config import describe_category, get_config
 from app.services.manifest_service import (
     ModManifest,
     DuplicateReport,
@@ -54,11 +54,11 @@ class CategoryChoiceDialog(QDialog):
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        self.chara_radio = QRadioButton(f"角色类（{self._chara}）")
+        self.chara_radio = QRadioButton(f"角色类：{describe_category(self._chara)}")
         self.chara_radio.setChecked(True)
         layout.addWidget(self.chara_radio)
 
-        self.studio_radio = QRadioButton(f"工作室类（{self._studio}）")
+        self.studio_radio = QRadioButton(f"工作室类：{describe_category(self._studio)}")
         layout.addWidget(self.studio_radio)
 
         btn_layout = QHBoxLayout()
@@ -135,10 +135,11 @@ class InstallConfirmDialog(QDialog):
         self._add_field(info_layout, "GUID", self.manifest.guid)
         self._add_field(info_layout, "作者", self.manifest.display_author)
         if self.target_category:
-            # F19-9：显示目标分类（三段式布局）
+            # F19-9：显示目标分类（三段式布局，带中文说明）
             self._add_field(
                 info_layout, "目标分类",
-                f"{self.target_category}/{self.manifest.display_author}",
+                f"{describe_category(self.target_category)}/"
+                f"{self.manifest.display_author}",
             )
 
         if self.dup_report.result == DuplicateResult.SAME_VERSION:

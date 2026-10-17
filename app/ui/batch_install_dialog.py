@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
 from PyQt6.QtGui import QColor
 
+from app.config import describe_category
 from app.models.mod import ModLocation
 from app.services.mod_service import (
     ModService,
@@ -106,7 +107,7 @@ class BatchInstallDialog(QDialog):
         # ── 标题 ──
         loc_text = "游戏 Mod 目录" if self._location == ModLocation.GAME else "本地仓库"
         if self._location == ModLocation.GAME and self._category:
-            loc_text += f"（分类：{self._category}/）"
+            loc_text += f"（分类：{describe_category(self._category)}/）"
         title = QLabel(f"📦 批量添加 Mod → {loc_text}")
         title.setObjectName("title")
         layout.addWidget(title)

@@ -77,6 +77,9 @@ class Mod(Base):
     # —— 仓库mod相对路径 ——
     repo_relative_path: Mapped[str] = mapped_column(String(1000), default="", comment="仓库mod的相对路径")
 
+    # —— 游戏mod相对路径（F19，仅 GAME 记录使用，REPO 记录始终为 ""）——
+    game_relative_path: Mapped[str] = mapped_column(String(1000), default="", comment="游戏mod的相对路径")
+
     # ── 复合索引：同一位置下 GUID 唯一 ──
     __table_args__ = (
         Index("idx_location_guid", "location", "guid", unique=True),
@@ -117,7 +120,8 @@ class Mod(Base):
             "status": self.status.value,
             "installed_at": self.installed_at.isoformat() if self.installed_at else None,
             "notes": self.notes,
-            "repo_relative_path": self.repo_relative_path
+            "repo_relative_path": self.repo_relative_path,
+            "game_relative_path": self.game_relative_path
         }
 
 

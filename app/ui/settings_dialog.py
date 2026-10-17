@@ -1,10 +1,11 @@
-"""设置对话框（F01 / F16）
+"""设置对话框（F01 / F16 / F19）
 
-需求文档 v1.3:
+需求文档 v1.5:
   - 游戏 Mod 路径配置（F01）
   - 本地仓库路径配置（F01）
   - 远程仓库 URL 配置（F16，P2，可选）
   - 行为配置：卸载前确认、清理空目录
+  - 分类目录配置（F19）：安装开关、分类清单、角色类/工作室类落点
   - 主题选择
 """
 
@@ -12,7 +13,7 @@ from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton, QCheckBox, QComboBox,
-    QGroupBox, QFormLayout, QFileDialog
+    QGroupBox, QFormLayout, QFileDialog, QPlainTextEdit
 )
 
 from app.config import get_config, save_config
@@ -69,6 +70,32 @@ class SettingsDialog(QDialog):
         remote_form.addRow("远程仓库 URL:", self.remote_url_edit)
         layout.addWidget(remote_group)
 
+        # ── 分类目录（F19）──
+        category_group = QGroupBox("分类目录（游戏端安装）")
+        category_group.setToolTip(
+            "开启后安装到游戏的 Mod 落入 {游戏Mod路径}/{分类}/{作者}/ 三段式目录；\n"
+            "仓库端不分类。未知顶层目录视为手动分类，照常扫描。"
+        )
+        category_layout = QVBoxLayout(category_group)
+
+        self.category_enabled_cb = QCheckBox("游戏分类目录安装（安装到 {分类}/{作者}/ 三段式目录）")
+        self.category_enabled_cb.setChecked(True)
+        category_layout.addWidget(self.category_enabled_cb)
+
+        category_form = QFormLayout()
+        category_form.addRow("分类目录清单:", self._make_categories_edit())
+
+        self.chara_category_combo = QComboBox()
+        self.chara_category_combo.setEditable(True)
+        category_form.addRow("角色类分类落点:", self.chara_category_combo)
+
+        self.studio_category_combo = QComboBox()
+        self.studio_category_combo.setEditable(True)
+        category_form.addRow("工作室类分类落点:", self.studio_category_combo)
+
+        category_layout.addLayout(category_form)
+        layout.addWidget(category_group)
+
         # ── 行为设置 ──
         behavior_group = QGroupBox("行为设置")
         behavior_layout = QVBoxLayout(behavior_group)
@@ -107,6 +134,35 @@ class SettingsDialog(QDialog):
 
         layout.addLayout(btn_layout)
 
+    def _make_categories_edit(self) -> QPlainTextEdit:
+        """分类目录清单多行编辑框（每行一个分类名，7.3）"""
+        self.categories_edit = QPlainTextEdit()
+        self.categories_edit.setPlaceholderText("每行一个分类目录名…")
+        self.categories_edit.setMaximumHeight(110)
+        self.categories_edit.textChanged.connect(self._refresh_category_combos)
+        return self.categories_edit
+
+    def _refresh_category_combos(self):
+        """按清单刷新两个落点下拉的候选项（保留当前选择/自定义输入）"""
+        names = self._category_names_from_edit()
+        for combo in (self.chara_category_combo, self.studio_category_combo):
+            current = combo.currentText().strip()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(names)
+            combo.setCurrentText(current)
+            combo.blockSignals(False)
+
+    def _category_names_from_edit(self) -> list[str]:
+        seen: set[str] = set()
+        names: list[str] = []
+        for line in self.categories_edit.toPlainText().splitlines():
+            name = line.strip().rstrip("/").strip()
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+        return names
+
     def _load_config(self):
         """加载当前配置到 UI"""
         cfg = self._config
@@ -115,6 +171,13 @@ class SettingsDialog(QDialog):
         self.remote_url_edit.setText(cfg.remote_repo_url)
         self.confirm_uninstall_cb.setChecked(cfg.confirm_before_uninstall)
         self.clean_empty_cb.setChecked(cfg.clean_empty_dirs)
+
+        # 分类目录（F19）：清单载入为多行文本，落点下拉候选项来自清单
+        cat = cfg.category
+        self.category_enabled_cb.setChecked(cat.game_category_enabled)
+        self.categories_edit.setPlainText("\n".join(cat.category_names))
+        self.chara_category_combo.setCurrentText(cat.category_chara)
+        self.studio_category_combo.setCurrentText(cat.category_studio)
 
         idx = self.theme_combo.findData(cfg.theme)
         if idx >= 0:
@@ -156,6 +219,14 @@ class SettingsDialog(QDialog):
         self._config.confirm_before_uninstall = self.confirm_uninstall_cb.isChecked()
         self._config.clean_empty_dirs = self.clean_empty_cb.isChecked()
         self._config.theme = self.theme_combo.currentData()
+
+        # 分类目录（F19）：清单多行文本以分号拼回；落点为空回退默认
+        names = self._category_names_from_edit()
+        cat = self._config.category
+        cat.game_category_enabled = self.category_enabled_cb.isChecked()
+        cat.game_categories = ";".join(names)
+        cat.category_chara = self.chara_category_combo.currentText().strip() or cat.category_chara
+        cat.category_studio = self.studio_category_combo.currentText().strip() or cat.category_studio
 
         save_config(self._config)
         self.accept()

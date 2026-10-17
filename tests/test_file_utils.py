@@ -5,11 +5,14 @@ from pathlib import Path
 from app.models.mod import Mod, ModLocation, ModStatus
 from app.utils.file_utils import (
     clean_empty_dirs,
+    compute_relative_path,
     compute_repo_relative_path,
     delete_file,
     ensure_dir,
     get_author_dir,
+    infer_author_from_path,
     rename_extension,
+    resolve_game_mod_path,
     resolve_repo_mod_path,
     safe_copy,
     safe_copy_simple,
@@ -248,3 +251,117 @@ def test_resolve_repo_mod_path_fallback_disabled_file(tmp_path):
     """回退公式取 current_file_name：DISABLED 行应得到 _disabled 文件名"""
     mod = _repo_mod(file_name="mod.zipmod", status=ModStatus.DISABLED)
     assert resolve_repo_mod_path(mod, tmp_path) == tmp_path / "Xavier" / "mod.zipmod_disabled"
+
+
+# ── compute_relative_path / resolve_game_mod_path（F19-6）──
+
+def test_compute_relative_path_posix(tmp_path):
+    root = tmp_path / "mods"
+    f = _touch(root / "ForCharactersLoading" / "Alice" / "mod.zipmod")
+    assert compute_relative_path(root, f) == "ForCharactersLoading/Alice/mod.zipmod"
+
+
+def _game_mod(**kwargs) -> Mod:
+    """构造用于 GAME 端路径解析的 Mod 行（不入库，只读属性）"""
+    base = dict(
+        guid="g", name="n", version="1.0.0", author="Alice",
+        file_name="mod.zipmod", location=ModLocation.GAME,
+        status=ModStatus.ENABLED, game_relative_path="",
+    )
+    base.update(kwargs)
+    return Mod(**base)
+
+
+def test_resolve_game_mod_path_prefers_relative(tmp_path):
+    mod = _game_mod(game_relative_path="ForStudioScenesLoading/Alice/mod.zipmod")
+    assert (
+        resolve_game_mod_path(mod, tmp_path)
+        == tmp_path / "ForStudioScenesLoading" / "Alice" / "mod.zipmod"
+    )
+
+
+def test_resolve_game_mod_path_swaps_basename_by_status(tmp_path):
+    """rel path 存启停前的启用名，定位时 basename 按当前状态替换（F19-6）"""
+    mod = _game_mod(game_relative_path="Cat/Alice/mod.zipmod")
+    assert resolve_game_mod_path(mod, tmp_path).name == "mod.zipmod"
+
+    disabled = _game_mod(
+        game_relative_path="Cat/Alice/mod.zipmod",
+        file_name="mod.zipmod", status=ModStatus.DISABLED,
+    )
+    assert resolve_game_mod_path(disabled, tmp_path).name == "mod.zipmod_disabled"
+
+
+def test_resolve_game_mod_path_rel_without_dir(tmp_path):
+    """文件直躺 Mods 根：rel path 只有文件名"""
+    mod = _game_mod(game_relative_path="mod.zipmod")
+    assert resolve_game_mod_path(mod, tmp_path) == tmp_path / "mod.zipmod"
+
+
+def test_resolve_game_mod_path_fallback_author_formula(tmp_path):
+    """老数据（rel path 为空）回退 {作者}/文件名 公式"""
+    mod = _game_mod(game_relative_path="")
+    assert resolve_game_mod_path(mod, tmp_path) == tmp_path / "Alice" / "mod.zipmod"
+
+
+def test_resolve_game_mod_path_fallback_reuses_existing_dir_case(tmp_path):
+    """回退公式经 get_author_dir：大小写复用磁盘已有目录"""
+    existing = tmp_path / "ALICE"
+    existing.mkdir()
+    mod = _game_mod(game_relative_path="")
+    assert resolve_game_mod_path(mod, tmp_path) == existing / "mod.zipmod"
+
+
+# ── infer_author_from_path（BR-CAT03 护栏，F19-7）────────────
+
+_CATEGORIES = ["AdditionalPoses", "ForCharactersLoading", "MyMods"]
+
+
+def test_infer_author_skips_category_segments(tmp_path):
+    """{分类}/{作者}/x.zipmod → 作者段（跳过分类）"""
+    f = tmp_path / "ForCharactersLoading" / "Zelwent" / "x.zipmod"
+    assert infer_author_from_path(f, tmp_path, _CATEGORIES) == "Zelwent"
+
+
+def test_infer_author_bottom_up_prefers_deepest(tmp_path):
+    """{分类}/{嵌套段}/…：自底向上取第一个非分类段"""
+    f = tmp_path / "ForCharactersLoading" / "Deep" / "Nest" / "x.zipmod"
+    assert infer_author_from_path(f, tmp_path, _CATEGORIES) == "Nest"
+
+
+def test_infer_author_all_category_segments_none(tmp_path):
+    """全为分类段（如文件直躺分类目录）→ None（归 Unknown）"""
+    f = tmp_path / "MyMods" / "x.zipmod"
+    assert infer_author_from_path(f, tmp_path, _CATEGORIES) is None
+
+
+def test_infer_author_file_at_root_none(tmp_path):
+    """文件直躺 Mods 根 → None"""
+    f = tmp_path / "x.zipmod"
+    assert infer_author_from_path(f, tmp_path, _CATEGORIES) is None
+
+
+def test_infer_author_category_case_insensitive(tmp_path):
+    """分类段大小写不敏感排除（目录匹配与清单比较一致，BR-CAT01）"""
+    f = tmp_path / "formycharsloading" / "Zelwent" / "x.zipmod"
+    assert infer_author_from_path(f, tmp_path, _CATEGORIES) == "Zelwent"
+
+
+def test_infer_author_plain_author_dir(tmp_path):
+    """平铺旧布局 {作者}/x.zipmod（作者名不在清单）→ 作者名"""
+    f = tmp_path / "Alice" / "x.zipmod"
+    assert infer_author_from_path(f, tmp_path, _CATEGORIES) == "Alice"
+
+
+# ── clean_empty_dirs 排除大小写（BR-CAT06）──────────────────
+
+def test_clean_empty_dirs_exclude_case_insensitive(tmp_path):
+    """分类目录名大小写与清单不一致时同样受保护"""
+    root = tmp_path / "work"
+    root.mkdir()
+    (root / "ForCharactersLoading").mkdir()  # 磁盘目录
+    (root / "gone").mkdir()
+    cleaned = clean_empty_dirs(root, exclude_names={"forcharactersloading"})
+    assert cleaned == 1
+    assert (root / "ForCharactersLoading").is_dir()
+    assert not (root / "gone").exists()

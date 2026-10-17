@@ -6,6 +6,8 @@
   - F08-1/2: 启用/禁用按钮
 """
 
+from pathlib import Path
+
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFrame, QScrollArea,
@@ -15,6 +17,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 
 from app.models.mod import Mod, ModLocation, ModStatus
 from app.config import get_config
+from app.utils.file_utils import resolve_game_mod_path
 
 
 class ModDetailPanel(QWidget):
@@ -63,7 +66,8 @@ class ModDetailPanel(QWidget):
         self.fields: dict[str, QLabel] = {}
         for key in ["name", "guid", "version", "author", "description",
                      "website", "file_name", "location", "status",
-                     "installed_at", "full_path", "repo_relative_path"]:
+                     "installed_at", "full_path", "repo_relative_path",
+                     "game_relative_path"]:
             label = QLabel("")
             label.setWordWrap(True)
             label.setTextInteractionFlags(
@@ -153,15 +157,13 @@ class ModDetailPanel(QWidget):
         installed = mod.installed_at.strftime("%Y-%m-%d %H:%M") if mod.installed_at else "未知"
         self.fields["installed_at"].setText(f"<b>安装时间：</b>{installed}")
 
-        # 完整路径
-        if mod.location == ModLocation.REPO and mod.repo_relative_path:
+        # 完整路径（GAME 端 rel path 优先定位，F19-6/9）
+        if mod.location == ModLocation.GAME:
+            full_path = str(resolve_game_mod_path(mod, Path(config.game_mod_path)))
+        elif mod.repo_relative_path:
             full_path = f"{config.repo_path}/{mod.repo_relative_path}"
         else:
-            base_path = (
-                config.game_mod_path if mod.location == ModLocation.GAME
-                else config.repo_path
-            )
-            full_path = f"{base_path}/{mod.author or 'Unknown'}/{mod.current_file_name}"
+            full_path = f"{config.repo_path}/{mod.author or 'Unknown'}/{mod.current_file_name}"
         self.fields["full_path"].setText(f"<b>完整路径：</b>{full_path}")
 
         # 仓库相对路径（仅 REPO 记录有意义）
@@ -177,6 +179,20 @@ class ModDetailPanel(QWidget):
             self.fields["repo_relative_path"].setVisible(True)
         else:
             self.fields["repo_relative_path"].setVisible(False)
+
+        # 游戏相对路径（仅 GAME 记录有意义，F19-9）
+        if mod.location == ModLocation.GAME:
+            if mod.game_relative_path:
+                self.fields["game_relative_path"].setText(
+                    f"<b>游戏相对路径：</b>{mod.game_relative_path}"
+                )
+            else:
+                self.fields["game_relative_path"].setText(
+                    "<b>游戏相对路径：</b><span style='color:#888'>(未记录，按作者目录定位)</span>"
+                )
+            self.fields["game_relative_path"].setVisible(True)
+        else:
+            self.fields["game_relative_path"].setVisible(False)
 
         # 按钮显示
         is_game = mod.location == ModLocation.GAME

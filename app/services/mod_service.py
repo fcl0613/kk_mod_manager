@@ -1,14 +1,15 @@
-"""Mod 核心业务服务（F04 / F06 / F08 / F14）
+"""Mod 核心业务服务（F04 / F06 / F08 / F14 / F19）
 
-需求文档 v1.3:
-  - F04: Mod 安装到游戏（复制 zipmod 到 {游戏路径}/{作者}/）
-  - F14: Mod 添加到仓库（复制 zipmod 到 {仓库路径}/{作者}/）
+需求文档 v1.5:
+  - F04: Mod 安装到游戏（复制 zipmod，F19 分类布局 {游戏路径}/{分类}/{作者}/）
+  - F14: Mod 添加到仓库（复制 zipmod 到 {仓库路径}/{作者}/，不分类）
   - F06: 卸载/移除（删除 zipmod 文件）
   - F08: 启用/禁用（修改文件扩展名）
+  - F19: 分类目录安装（卡片视角路由，category 由调用方给出，不来自 zip 内容）
 
 核心设计：
   - 安装 = 复制 .zipmod 到目标目录（不解压！）
-  - 按作者名分类创建目录
+  - GAME 端按分类+作者建目录并持久化 game_relative_path；REPO 端维持单层作者目录
   - 双重检测（游戏+仓库）防止重复
 """
 
@@ -37,8 +38,11 @@ from app.utils.file_utils import (
     rename_extension,
     clean_empty_dirs,
     get_author_dir,
+    compute_relative_path,
     compute_repo_relative_path,
     resolve_repo_mod_path,
+    resolve_game_mod_path,
+    infer_author_from_path,
 )
 
 
@@ -158,14 +162,29 @@ class ModService:
         self.manifest_svc = ManifestService()
 
     # ═══════════════════════════════════════════════════════════
-    # 安装到游戏（F04）
+    # 安装到游戏（F04 / F19）
     # ═══════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _game_target_dir(game_root: Path, category: str | None, author: str) -> Path:
+        """计算 GAME 端安装目标目录（F19，开发文档 _game_target_dir）。
+
+        分类开关开启且调用方给出 category → {分类}/{作者}/ 三段式
+        （两级目录都复用大小写不敏感匹配，BR-CAT01）；
+        否则（category 为空或开关关闭）→ {作者}/ 旧公式（F19-5）。
+        category 只能来自调用方（卡片上下文路由或用户选择），不来自 zip 内容（BR-CAT02）。
+        """
+        if category and get_config().category.game_category_enabled:
+            category_dir = get_author_dir(game_root, category)
+            return get_author_dir(category_dir, author)
+        return get_author_dir(game_root, author)
 
     def install_to_game(
         self,
         zipmod_path: Path,
         confirm_upgrade: bool = False,
         confirm_downgrade: bool = False,
+        category: str | None = None,
     ) -> InstallResult:
         """
         将 .zipmod 安装到游戏 Mod 路径。
@@ -173,9 +192,9 @@ class ModService:
         流程（F04-2）：
           1. 解析 manifest.xml
           2. 重复检测（游戏+仓库）
-          3. 目标目录 = {游戏Mod路径}/{作者名}/
+          3. 目标目录 = {游戏Mod路径}/{分类}/{作者名}/（F19，开关关/无分类回退 {作者名}/）
           4. 复制 zipmod 文件
-          5. 写入数据库
+          5. 写入数据库（含 game_relative_path）
 
         重复处理：
           - SAME_VERSION: 拒绝
@@ -250,27 +269,27 @@ class ModService:
             self.session.delete(dup.existing_mod)
             self.session.flush()
 
-        # 5. 复制文件到目标目录
-        author_dir = get_author_dir(game_root, manifest.author)
-        logger.debug("安装目标目录: {}", author_dir)
+        # 5. 复制文件到目标目录（F19 分类布局）
+        target_dir = self._game_target_dir(game_root, category, manifest.author)
+        logger.debug("安装目标目录: {}", target_dir)
 
         try:
             dest_file = safe_copy(
                 src=zipmod_path,
-                dst_dir=author_dir,
+                dst_dir=target_dir,
                 file_name=zipmod_path.name,
                 version=manifest.version,
             )
             logger.info("文件复制成功: {} → {}", zipmod_path.name, dest_file)
         except OSError as e:
-            logger.error("文件复制失败: {} → {} - {}", zipmod_path.name, author_dir, e)
+            logger.error("文件复制失败: {} → {} - {}", zipmod_path.name, target_dir, e)
             return InstallResult(
                 success=False,
                 message=f"文件复制失败：{e}",
                 manifest=manifest,
             )
 
-        # 6. 数据库记录
+        # 6. 数据库记录（持久化 game_relative_path，F19-6）
         mod = Mod(
             guid=manifest.guid,
             name=manifest.name,
@@ -283,6 +302,7 @@ class ModService:
             location=ModLocation.GAME,
             status=ModStatus.ENABLED,
             installed_at=datetime.now(),
+            game_relative_path=compute_relative_path(game_root, dest_file),
         )
         self.session.add(mod)
 
@@ -444,9 +464,11 @@ class ModService:
         zipmod_path: Path,
         confirm_upgrade: bool = False,
         confirm_downgrade: bool = False,
+        category: str | None = None,
     ) -> InstallResult:
         """
         安装并收藏：先添加到仓库，再安装到游戏（Q-02 确认流程）。
+        category 仅作用于游戏端安装（F19，仓库端不分类）。
         """
         logger.info("执行安装并收藏: {}", zipmod_path.name)
         # 先添加到仓库
@@ -459,11 +481,12 @@ class ModService:
             logger.warning("安装并收藏 - 添加到仓库失败: {}", repo_result.message)
             return repo_result
 
-        # 再从仓库安装到游戏
+        # 再安装到游戏
         game_result = self.install_to_game(
             zipmod_path,
             confirm_upgrade=confirm_upgrade,
             confirm_downgrade=confirm_downgrade,
+            category=category,
         )
 
         if game_result.success:
@@ -488,16 +511,13 @@ class ModService:
 
         # 删除文件
         if mod.location == ModLocation.GAME:
-            # GAME 端保持原状
+            # GAME 端优先用 game_relative_path（F19-6），为空回退作者目录旧公式
             base_path = config.game_mod_path
-            author_dir = get_author_dir(Path(base_path), mod.author)
-            file_path = author_dir / mod.current_file_name
+            file_path = resolve_game_mod_path(mod, Path(base_path))
         else:
             # REPO 端优先用 repo_relative_path
             base_path = config.repo_path
             file_path = resolve_repo_mod_path(mod, Path(base_path))
-            # REPO 端也需要 author_dir 用于清理空目录
-            author_dir = get_author_dir(Path(base_path), mod.author)
 
         if file_path.exists():
             try:
@@ -510,10 +530,16 @@ class ModService:
                     message=f"删除文件失败：{e}",
                 )
 
-        # 清理空目录
+        # 清理空目录（GAME 端排除分类目录：分类目录即使被清空也不删除，BR-CAT06）
         if config.clean_empty_dirs:
-            clean_empty_dirs(author_dir)
-            clean_empty_dirs(Path(base_path))
+            clean_empty_dirs(file_path.parent)
+            if mod.location == ModLocation.GAME:
+                clean_empty_dirs(
+                    Path(base_path),
+                    exclude_names=set(config.category.category_names),
+                )
+            else:
+                clean_empty_dirs(Path(base_path))
 
         # 日志
         op_type = "uninstall" if mod.location == ModLocation.GAME else "repo_remove"
@@ -562,11 +588,12 @@ class ModService:
             return InstallResult(success=True, message="Mod 已经是禁用状态")
 
         config = get_config()
-        author_dir = get_author_dir(Path(config.game_mod_path), mod.author)
+        # 定位统一走 game_relative_path 优先（F19-6，basename 按当前状态替换）
+        current_path = resolve_game_mod_path(mod, Path(config.game_mod_path))
 
         if enabled:
             # 启用：.zipmod_disabled → .zipmod
-            old_path = author_dir / mod.is_disabled_file
+            old_path = current_path
             new_path = rename_extension(old_path, ".zipmod_disabled", ".zipmod")
             if new_path is None:
                 logger.warning("启用失败 - 文件不存在: {}", old_path)
@@ -579,7 +606,7 @@ class ModService:
             logger.info("启用 Mod: {} → {}", old_path, new_path)
         else:
             # 禁用：.zipmod → .zipmod_disabled
-            old_path = author_dir / mod.file_name
+            old_path = current_path
             new_path = rename_extension(old_path, ".zipmod", ".zipmod_disabled")
             if new_path is None:
                 logger.warning("禁用失败 - 文件不存在: {}", old_path)
@@ -612,11 +639,16 @@ class ModService:
     # 从仓库安装到游戏（卡片解析结果用，F15-5）
     # ═══════════════════════════════════════════════════════════
 
-    def install_from_repo(self, mod_id: int) -> InstallResult:
+    def install_from_repo(
+        self,
+        mod_id: int,
+        category: str | None = None,
+    ) -> InstallResult:
         """
         将仓库中的 Mod 安装到游戏。
 
         用于卡片解析结果中的"一键安装"功能。
+        category 为 F19 目标分类（由卡片依赖粗分路由或用户选择给出）。
         """
         repo_mod: Mod | None = self.session.get(Mod, mod_id)
         if repo_mod is None:
@@ -670,12 +702,12 @@ class ModService:
                 message=f"仓库中文件不存在：{src_file}",
             )
 
-        game_author_dir = get_author_dir(game_path, repo_mod.author)
-        logger.debug("从仓库安装 - 复制: {} → {}", src_file, game_author_dir)
+        game_target_dir = self._game_target_dir(game_path, category, repo_mod.author)
+        logger.debug("从仓库安装 - 复制: {} → {}", src_file, game_target_dir)
         try:
             dest_file = safe_copy(
                 src=src_file,
-                dst_dir=game_author_dir,
+                dst_dir=game_target_dir,
                 file_name=src_file.name,
                 version=repo_mod.version,
             )
@@ -699,6 +731,7 @@ class ModService:
             location=ModLocation.GAME,
             status=ModStatus.ENABLED,
             installed_at=datetime.now(),
+            game_relative_path=compute_relative_path(game_path, dest_file),
         )
         self.session.add(game_mod)
 
@@ -768,11 +801,10 @@ class ModService:
             self.session.delete(repo_dup)
             self.session.flush()
 
-        # 从游戏复制到仓库
+        # 从游戏复制到仓库（源定位走 game_relative_path 优先，F19-6）
         game_path = Path(config.game_mod_path)
         repo_path = Path(config.repo_path)
-        author_dir = get_author_dir(game_path, game_mod.author)
-        src_file = author_dir / game_mod.current_file_name
+        src_file = resolve_game_mod_path(game_mod, game_path)
 
         if not src_file.exists():
             logger.error("添加到仓库失败 - 游戏文件不存在: {}", src_file)
@@ -1024,12 +1056,16 @@ class ModService:
                 continue
             seen_guids.add(manifest.guid)
 
-            # 检查 author 目录
-            parent_dir = zipmod_file.parent
-            if parent_dir != base_path:
-                # 文件在子目录中，用目录名推断作者
-                if not manifest.author:
-                    manifest.author = parent_dir.name
+            # 作者推断：
+            #   GAME 端用 BR-CAT03 护栏（分类段自底向上排除，不受分类开关控制）；
+            #   REPO 端维持单层父目录推断（仓库不分类）。
+            if not manifest.author:
+                if location == ModLocation.GAME:
+                    manifest.author = infer_author_from_path(
+                        zipmod_file, base_path, config.category.category_names
+                    ) or ""
+                elif zipmod_file.parent != base_path:
+                    manifest.author = zipmod_file.parent.name
 
             mod = Mod(
                 guid=manifest.guid,
@@ -1048,6 +1084,10 @@ class ModService:
                 repo_relative_path=(
                     zipmod_file.relative_to(base_path).as_posix()
                     if location == ModLocation.REPO else ""
+                ),
+                game_relative_path=(
+                    zipmod_file.relative_to(base_path).as_posix()
+                    if location == ModLocation.GAME else ""
                 ),
             )
             self.session.add(mod)
@@ -1159,9 +1199,15 @@ class ModService:
             if mod is None:
                 manifest = chosen["manifest"]
                 author = _normalize_author(manifest.author)
-                if not manifest.author and chosen["path"].parent != base_path:
-                    # 文件在子目录中，用目录名推断作者（与 refresh_from_disk 一致）
-                    author = chosen["path"].parent.name
+                if not manifest.author:
+                    # 作者推断：GAME 端用 BR-CAT03 护栏（分类段排除，
+                    # 不受分类开关控制）；REPO 端单层父目录（与 refresh_from_disk 一致）
+                    if location == ModLocation.GAME:
+                        author = _normalize_author(infer_author_from_path(
+                            chosen["path"], base_path, config.category.category_names
+                        ))
+                    elif chosen["path"].parent != base_path:
+                        author = chosen["path"].parent.name
                 new_mod = Mod(
                     guid=guid,
                     name=manifest.name,
@@ -1181,6 +1227,10 @@ class ModService:
                     repo_relative_path=(
                         chosen["path"].relative_to(base_path).as_posix()
                         if location == ModLocation.REPO else ""
+                    ),
+                    game_relative_path=(
+                        chosen["path"].relative_to(base_path).as_posix()
+                        if location == ModLocation.GAME else ""
                     ),
                 )
                 self.session.add(new_mod)
@@ -1262,7 +1312,7 @@ class ModService:
         """推导 DB 记录对应的磁盘路径（与 _remove_mod_files 同一公式）"""
         if mod.location == ModLocation.REPO:
             return resolve_repo_mod_path(mod, base_path)
-        return get_author_dir(base_path, mod.author) / mod.current_file_name
+        return resolve_game_mod_path(mod, base_path)
 
     def _apply_mod_update(
         self,
@@ -1294,6 +1344,10 @@ class ModService:
                 changes.append(f"路径 {mod.repo_relative_path or '(空)'} → {rel}")
                 mod.repo_relative_path = rel  # 顺带回填老数据
         else:
+            rel = file_path.relative_to(base_path).as_posix()
+            if mod.game_relative_path != rel:
+                changes.append(f"路径 {mod.game_relative_path or '(空)'} → {rel}")
+                mod.game_relative_path = rel  # 顺带回填老数据（F19-6）
             new_status = ModStatus.DISABLED if is_disabled else ModStatus.ENABLED
             if mod.status != new_status:
                 old = "禁用" if mod.status == ModStatus.DISABLED else "启用"
@@ -1322,11 +1376,18 @@ class ModService:
 
         # manifest 无作者 → DB 的 author 是目录推断值（或空）。
         # 文件被移动到其他子目录后按实际目录重新推断：
-        #   GAME 端路径完全靠「作者目录/文件名」推导，不更正会导致
-        #   卸载/启停定位失败，磁盘残留孤儿文件。
+        #   GAME 端用 BR-CAT03 护栏（分类段自底向上排除，避免把分类名
+        #   写成作者）；REPO 端用单层父目录名。定位本身已由 rel path
+        #   优先保障，此处更正主要保证作者分组展示正确。
         # manifest 有作者时不做此更正（manifest 元数据优先于目录名）。
         if not manifest.author and file_path.parent != base_path:
-            dir_name = file_path.parent.name
+            if location == ModLocation.GAME:
+                config = get_config()
+                dir_name = infer_author_from_path(
+                    file_path, base_path, config.category.category_names
+                ) or "Unknown"
+            else:
+                dir_name = file_path.parent.name
             if (mod.author or "").strip().lower() != dir_name.strip().lower():
                 changes.append(
                     f"作者目录 {mod.author or '(空)'} → {dir_name}（按实际位置更正）"
@@ -1381,6 +1442,7 @@ class ModService:
         zipmod_paths: list[Path],
         location: ModLocation,
         progress_callback: Callable[[int, int, str], None] | None = None,
+        category: str | None = None,
     ) -> BatchInstallResult:
         """
         批量安装 / 添加 Mod。
@@ -1394,6 +1456,7 @@ class ModService:
             zipmod_paths: 要安装的 .zipmod 文件列表
             location: 目标位置（GAME / REPO）
             progress_callback: 可选进度回调 (current, total, file_name)
+            category: GAME 端目标分类（F19，REPO 端忽略）
 
         Returns:
             BatchInstallResult 包含每个文件的处理结果
@@ -1434,7 +1497,7 @@ class ModService:
             if progress_callback:
                 progress_callback(idx, len(zipmod_paths), fp.name)
 
-            item = self._batch_install_single(fp, location, base_path)
+            item = self._batch_install_single(fp, location, base_path, category)
             batch.items.append(item)
 
             if item.status == BatchItemStatus.SUCCESS:
@@ -1461,6 +1524,7 @@ class ModService:
         fp: Path,
         location: ModLocation,
         base_path: Path,
+        category: str | None = None,
     ) -> BatchItemResult:
         """批量安装中处理单个文件，不抛异常，结果封装为 BatchItemResult"""
         # 1. 解析 manifest
@@ -1513,8 +1577,11 @@ class ModService:
             self.session.delete(dup.existing_mod)
             self.session.flush()
 
-        # 4. 复制文件
-        author_dir = get_author_dir(base_path, manifest.author)
+        # 4. 复制文件（GAME 端按 F19 分类布局）
+        if location == ModLocation.GAME:
+            author_dir = self._game_target_dir(base_path, category, manifest.author)
+        else:
+            author_dir = get_author_dir(base_path, manifest.author)
         try:
             dest_file = safe_copy(
                 src=fp,
@@ -1548,6 +1615,10 @@ class ModService:
                 compute_repo_relative_path(base_path, dest_file)
                 if location == ModLocation.REPO else ""
             ),
+            game_relative_path=(
+                compute_relative_path(base_path, dest_file)
+                if location == ModLocation.GAME else ""
+            ),
         )
         self.session.add(mod)
 
@@ -1576,15 +1647,12 @@ class ModService:
 
     @staticmethod
     def _remove_mod_files(mod: Mod, base_path: str) -> None:
-        """删除 Mod 对应的磁盘文件"""
+        """删除 Mod 对应的磁盘文件（rel path 优先定位，F19-6）"""
         base = Path(base_path)
-        if mod.location == ModLocation.REPO and mod.repo_relative_path:
-            # REPO 端优先用精确路径
-            file_path = base / mod.repo_relative_path
+        if mod.location == ModLocation.REPO:
+            file_path = resolve_repo_mod_path(mod, base)
         else:
-            # GAME 端 或 老数据回退
-            author_dir = get_author_dir(base, mod.author)
-            file_path = author_dir / mod.current_file_name
+            file_path = resolve_game_mod_path(mod, base)
         if file_path.exists():
             delete_file(file_path)
 

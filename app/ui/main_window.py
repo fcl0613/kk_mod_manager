@@ -29,7 +29,7 @@ from app.models.mod import Mod, ModLocation, ModStatus, OperationLog
 from app.services.mod_service import ModService, InstallResult
 from app.services.card_service import CardService, CardParseResult
 from app.ui.settings_dialog import SettingsDialog
-from app.ui.install_dialog import InstallConfirmDialog
+from app.ui.install_dialog import InstallConfirmDialog, CategoryChoiceDialog
 from app.ui.mod_detail_panel import ModDetailPanel
 from app.ui.card_result_dialog import CardResultDialog
 from app.ui.card_parse_page import CardParsePage
@@ -54,6 +54,7 @@ class MainWindow(QMainWindow):
         self._pending_path: Path | None = None  # 等待重试的原始文件路径
         self._pending_location: ModLocation | None = None  # 等待重试的目标位置
         self._pending_action: PendingAction | None = None  # 等待重试的操作类型
+        self._pending_category: str | None = None  # 等待重试的 F19 目标分类（None = 平铺）
 
         # 分页状态
         self._page_size = 200  # 每页默认 200 个 Mod
@@ -338,26 +339,43 @@ class MainWindow(QMainWindow):
         self.page_stack.setCurrentIndex(1)
 
     # ═══════════════════════════════════════════════════════
-    # 拖放处理（用于卡片拖放）
+    # 拖放处理（卡片 PNG / zipmod 安装）
     # ═══════════════════════════════════════════════════════
+
+    @staticmethod
+    def _is_zipmod(path: Path) -> bool:
+        return path.suffix.lower() in (".zipmod", ".zipmod_disabled")
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
             urls = event.mimeData().urls()
             for url in urls:
                 path = Path(url.toLocalFile())
-                if path.suffix.lower() == ".png":
+                if path.suffix.lower() == ".png" or self._is_zipmod(path):
                     event.acceptProposedAction()
                     return
         event.ignore()
 
     def dropEvent(self, event: QDropEvent):
-        if event.mimeData().hasUrls():
-            for url in event.mimeData().urls():
-                path = Path(url.toLocalFile())
-                if path.suffix.lower() == ".png":
-                    self._parse_card(path)
-                    break
+        if not event.mimeData().hasUrls():
+            return
+        paths = [Path(url.toLocalFile()) for url in event.mimeData().urls()]
+        # 卡片 PNG → 解析依赖
+        for path in paths:
+            if path.suffix.lower() == ".png":
+                self._parse_card(path)
+                return
+        # zipmod → 无卡片上下文安装（F19-4：询问目标分类）
+        zipmods = [p for p in paths if self._is_zipmod(p)]
+        if zipmods:
+            if not get_config().game_mod_path:
+                QMessageBox.warning(self, "提示", "请先在设置中配置游戏 Mod 路径")
+                return
+            category = self._ask_install_category()
+            if category is None:
+                return  # 用户取消
+            for path in zipmods:
+                self._do_install(str(path), ModLocation.GAME, category)
 
     # ═══════════════════════════════════════════════════════
     # 卡片解析
@@ -488,9 +506,9 @@ class MainWindow(QMainWindow):
             self._card_result = result
         return self._card_result
 
-    def install_repo_mod(self, mod_id: int) -> tuple[bool, str]:
-        """从仓库安装 Mod 到游戏（供卡片结果面板调用）"""
-        result = self._mod_service.install_from_repo(mod_id)
+    def install_repo_mod(self, mod_id: int, category: str | None = None) -> tuple[bool, str]:
+        """从仓库安装 Mod 到游戏（供卡片结果面板调用；category 为 F19 目标分类）"""
+        result = self._mod_service.install_from_repo(mod_id, category=category)
         if result.success:
             self._refresh_current()
         return result.success, result.message
@@ -547,6 +565,19 @@ class MainWindow(QMainWindow):
     # Mod 安装/添加
     # ═══════════════════════════════════════════════════════
 
+    def _ask_install_category(self) -> str | None:
+        """询问 GAME 端安装目标分类（F19-4，无卡片上下文入口）。
+
+        Returns:
+            "" = 分类开关关闭（走旧公式）；None = 用户取消；其他 = 目标分类名
+        """
+        if not get_config().category.game_category_enabled:
+            return ""
+        dialog = CategoryChoiceDialog(self)
+        if dialog.exec() != CategoryChoiceDialog.DialogCode.Accepted:
+            return None
+        return dialog.selected
+
     def _install_mod(self, location: ModLocation):
         """安装 Mod 到游戏 或 添加到仓库"""
         # 检查路径
@@ -568,7 +599,14 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
 
-        self._do_install(file_path, location)
+        # GAME 端询问目标分类（F19-4）
+        category: str | None = None
+        if location == ModLocation.GAME:
+            category = self._ask_install_category()
+            if category is None:
+                return  # 用户取消
+
+        self._do_install(file_path, location, category)
 
     def _install_and_collect(self):
         """安装并收藏"""
@@ -589,10 +627,15 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
 
+        category = self._ask_install_category()
+        if category is None:
+            return  # 用户取消
+
         self.status_bar.showMessage("正在安装并收藏...")
         self._pending_path = Path(file_path)
         self._pending_action = PendingAction.INSTALL_AND_COLLECT
-        result = self._mod_service.install_and_collect(Path(file_path))
+        self._pending_category = category
+        result = self._mod_service.install_and_collect(Path(file_path), category=category)
         self._handle_install_result(result)
 
     def _batch_install(self, location: ModLocation):
@@ -605,12 +648,19 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请先在设置中配置本地仓库路径")
             return
 
-        dialog = BatchInstallDialog(self._mod_service, location, parent=self)
+        # GAME 端询问一次目标分类，整个批次共用（F19-4）
+        category: str | None = None
+        if location == ModLocation.GAME:
+            category = self._ask_install_category()
+            if category is None:
+                return  # 用户取消
+
+        dialog = BatchInstallDialog(self._mod_service, location, parent=self, category=category)
         dialog.install_finished.connect(self._refresh_current)
         dialog.exec()
 
-    def _do_install(self, file_path: str, location: ModLocation):
-        """执行安装"""
+    def _do_install(self, file_path: str, location: ModLocation, category: str | None = None):
+        """执行安装（category 为 F19 目标分类，仅 GAME 端使用）"""
         loc_text = "安装到游戏" if location == ModLocation.GAME else "添加到仓库"
         logger.info("{} - 开始: {}", loc_text, file_path)
         self.status_bar.showMessage(f"正在{loc_text}...")
@@ -619,11 +669,12 @@ class MainWindow(QMainWindow):
         self._pending_path = Path(file_path)
         self._pending_location = location
         self._pending_action = PendingAction.INSTALL
+        self._pending_category = category
 
         result: InstallResult
 
         if location == ModLocation.GAME:
-            result = self._mod_service.install_to_game(Path(file_path))
+            result = self._mod_service.install_to_game(Path(file_path), category=category)
         else:
             result = self._mod_service.add_to_repo(Path(file_path))
 
@@ -655,6 +706,7 @@ class MainWindow(QMainWindow):
                 result.dup_report,
                 action_name=action,
                 parent=self,
+                target_category=self._pending_category or "",
             )
             if dialog.exec() == InstallConfirmDialog.DialogCode.Accepted:
                 # 用户确认，重新执行（带确认标志）
@@ -669,12 +721,14 @@ class MainWindow(QMainWindow):
                         self._pending_path,
                         confirm_upgrade=dialog.confirm_upgrade,
                         confirm_downgrade=dialog.confirm_downgrade,
+                        category=self._pending_category,
                     )
                 elif self._pending_location == ModLocation.GAME:
                     retry = self._mod_service.install_to_game(
                         self._pending_path,
                         confirm_upgrade=dialog.confirm_upgrade,
                         confirm_downgrade=dialog.confirm_downgrade,
+                        category=self._pending_category,
                     )
                 else:
                     retry = self._mod_service.add_to_repo(
@@ -742,14 +796,18 @@ class MainWindow(QMainWindow):
             self.status_bar.clearMessage()
 
     def _do_install_from_repo(self, mod_id: int):
-        """从仓库安装 Mod 到游戏（详情面板按钮触发）"""
+        """从仓库安装 Mod 到游戏（详情面板按钮触发，无卡片上下文 → 询问分类 F19-4）"""
         mod = self._mod_service.get_mod_by_id(mod_id)
         if mod is None:
             return
 
+        category = self._ask_install_category()
+        if category is None:
+            return  # 用户取消
+
         logger.info("从仓库安装到游戏: {} (ID={})", mod.name, mod_id)
         self.status_bar.showMessage(f"正在从仓库安装：{mod.name}...")
-        result = self._mod_service.install_from_repo(mod_id)
+        result = self._mod_service.install_from_repo(mod_id, category=category)
 
         if result.success:
             QMessageBox.information(self, "操作成功", result.message)

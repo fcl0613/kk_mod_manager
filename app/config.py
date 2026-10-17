@@ -2,17 +2,57 @@
 
 配置存储在 exe 所在目录的 data/config.json（需求文档 8.3）。
 
-需求文档 v1.3 配置项：
+需求文档 v1.5 配置项：
   - game_mod_path: 游戏 Mod 路径
   - repo_path: 本地 Mod 仓库路径
   - remote_repo_url: 远程仓库 URL（可选）
   - UI 主题: 暗色/亮色
   - 行为配置: 卸载前确认、清理空目录
+  - 分类目录（F19）: 安装开关、分类清单、角色类/工作室类落点
 """
 
 from pathlib import Path
 import json
 from pydantic import BaseModel, Field
+
+# F19-2 默认分类目录清单（分号分隔，社区主流布局）
+DEFAULT_GAME_CATEGORIES = (
+    "AdditionalPoses;BasisAndShaders;ForCharactersLoading;"
+    "ForStudioScenesLoading;KK_-ExclusivesAndUncensors;KK_-ExtraMaps;MyMods"
+)
+
+
+class CategoryConfig(BaseModel):
+    """游戏分类目录安装配置（F19，需求文档 7.3）"""
+
+    game_category_enabled: bool = Field(
+        default=True,
+        description="分类目录安装开关：开启时安装到 {游戏Mod路径}/{分类}/{作者}/",
+    )
+    game_categories: str = Field(
+        default=DEFAULT_GAME_CATEGORIES,
+        description="分类目录名清单（分号分隔）",
+    )
+    category_chara: str = Field(
+        default="ForCharactersLoading",
+        description="角色类依赖的安装目标分类（人物/服装卡及场景卡【角色】）",
+    )
+    category_studio: str = Field(
+        default="ForStudioScenesLoading",
+        description="工作室类依赖的安装目标分类（场景卡【工作室】）",
+    )
+
+    @property
+    def category_names(self) -> list[str]:
+        """分类目录名列表（去空、保序去重）"""
+        seen: set[str] = set()
+        result: list[str] = []
+        for name in self.game_categories.split(";"):
+            name = name.strip()
+            if name and name not in seen:
+                seen.add(name)
+                result.append(name)
+        return result
 
 
 class AppConfig(BaseModel):
@@ -49,6 +89,9 @@ class AppConfig(BaseModel):
     clean_empty_dirs: bool = Field(
         default=True, description="卸载/移除后清理空作者目录"
     )
+
+    # ── 分类目录（F19）──
+    category: CategoryConfig = Field(default_factory=CategoryConfig)
 
     # ── 版本 ──
     config_version: str = Field(default="1", description="配置文件版本号")

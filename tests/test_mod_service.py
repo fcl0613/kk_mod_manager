@@ -182,6 +182,115 @@ class TestInstallToGame:
 
 
 # ═══════════════════════════════════════════════════════════
+# 分类目录安装（F19）
+# ═══════════════════════════════════════════════════════════
+
+class TestCategoryInstall:
+    def test_install_with_category_lands_three_segment(self, svc, dirs):
+        """F19-1：传分类 → {分类}/{作者}/ 三段式 + game_relative_path 落库"""
+        src = make_zipmod(dirs.root / "src", "ModA", "guid.a", author="Alice")
+        res = svc.install_to_game(src, category="ForStudioScenesLoading")
+
+        assert res.success
+        assert (dirs.game / "ForStudioScenesLoading" / "Alice" / "ModA.zipmod").is_file()
+        assert res.mod.game_relative_path == "ForStudioScenesLoading/Alice/ModA.zipmod"
+
+    def test_install_without_category_stays_flat(self, svc, dirs):
+        """category=None → 旧公式平铺（兼容）；rel path 仍持久化（F19-6）"""
+        src = make_zipmod(dirs.root / "src", "ModA", "guid.a", author="Alice")
+        res = svc.install_to_game(src)
+
+        assert res.success
+        assert files_under(dirs.game) == {"Alice/ModA.zipmod"}
+        assert res.mod.game_relative_path == "Alice/ModA.zipmod"
+
+    def test_category_ignored_when_toggle_off(self, svc, dirs):
+        """F19-5：开关关闭 → 传了 category 也回退旧公式"""
+        set_config()
+        cfg.get_config().category.game_category_enabled = False
+        src = make_zipmod(dirs.root / "src", "ModA", "guid.a", author="Alice")
+        res = svc.install_to_game(src, category="ForStudioScenesLoading")
+
+        assert res.success
+        assert files_under(dirs.game) == {"Alice/ModA.zipmod"}
+        assert res.mod.game_relative_path == "Alice/ModA.zipmod"
+
+    def test_category_dir_reuse_case_insensitive(self, svc, dirs):
+        """BR-CAT01：分类目录复用磁盘已有大小写拼写"""
+        (dirs.game / "FORSTUDIOSCENESLOADING").mkdir()
+        src = make_zipmod(dirs.root / "src", "ModA", "guid.a", author="Alice")
+        res = svc.install_to_game(src, category="ForStudioScenesLoading")
+
+        assert res.success
+        assert (dirs.game / "FORSTUDIOSCENESLOADING" / "Alice" / "ModA.zipmod").is_file()
+        assert res.mod.game_relative_path == (
+            "FORSTUDIOSCENESLOADING/Alice/ModA.zipmod"
+        )
+
+    def test_uninstall_keeps_category_dir(self, svc, dirs):
+        """BR-CAT06：分类目录清空也不删；其下作者目录正常清理"""
+        src = make_zipmod(dirs.root / "src", "ModA", "guid.a", author="Alice")
+        res = svc.install_to_game(src, category="MyMods")
+        assert res.success
+
+        r = svc.uninstall(res.mod.id)
+        assert r.success
+        assert not (dirs.game / "MyMods" / "Alice" / "ModA.zipmod").exists()
+        assert not (dirs.game / "MyMods" / "Alice").exists()
+        assert (dirs.game / "MyMods").is_dir()
+
+    def test_set_enabled_renames_via_rel_path(self, svc, dirs):
+        """F19-6：启停改名经 rel path 定位，双向可用"""
+        src = make_zipmod(dirs.root / "src", "ModA", "guid.a", author="Alice")
+        res = svc.install_to_game(src, category="ForCharactersLoading")
+        assert res.success
+
+        r1 = svc.set_enabled(res.mod.id, False)
+        assert r1.success
+        assert (dirs.game / "ForCharactersLoading" / "Alice" / "ModA.zipmod_disabled").is_file()
+
+        r2 = svc.set_enabled(res.mod.id, True)
+        assert r2.success
+        assert (dirs.game / "ForCharactersLoading" / "Alice" / "ModA.zipmod").is_file()
+
+    def test_install_from_repo_with_category(self, svc, dirs):
+        """F19-10：从仓库安装（卡片页入口）走分类路由"""
+        src = make_zipmod(dirs.root / "src", "ModA", "guid.a", author="Alice")
+        assert svc.add_to_repo(src).success
+        repo_mod = svc.get_repo_mod_by_guid("guid.a")
+
+        res = svc.install_from_repo(repo_mod.id, category="ForStudioScenesLoading")
+        assert res.success
+        assert (dirs.game / "ForStudioScenesLoading" / "Alice" / "ModA.zipmod").is_file()
+        assert res.mod.game_relative_path == "ForStudioScenesLoading/Alice/ModA.zipmod"
+
+    def test_batch_install_game_with_category(self, svc, dirs):
+        a = make_zipmod(dirs.root / "s", "ModA", "guid.a", author="Alice")
+        b = make_zipmod(dirs.root / "s", "ModB", "guid.b", author="Bob")
+
+        result = svc.batch_install([a, b], ModLocation.GAME, category="MyMods")
+        assert result.success_count == 2
+        assert (dirs.game / "MyMods" / "Alice" / "ModA.zipmod").is_file()
+        assert (dirs.game / "MyMods" / "Bob" / "ModB.zipmod").is_file()
+        assert svc.get_game_mod_by_guid("guid.a").game_relative_path == (
+            "MyMods/Alice/ModA.zipmod"
+        )
+
+    def test_legacy_row_without_rel_path_falls_back(self, svc, dirs, db_session):
+        """F19-6 老数据：game_relative_path 为空 → 回退作者目录公式定位"""
+        mod = seed_mod(db_session, "guid.old", "OldMod", "Alice")
+        make_zipmod(dirs.game / "Alice", "OldMod", "guid.old", author="Alice")
+
+        r = svc.set_enabled(mod.id, False)
+        assert r.success
+        assert (dirs.game / "Alice" / "OldMod.zipmod_disabled").is_file()
+
+        r2 = svc.uninstall(mod.id)
+        assert r2.success
+        assert files_under(dirs.game) == set()
+
+
+# ═══════════════════════════════════════════════════════════
 # add_to_repo / install_and_collect
 # ═══════════════════════════════════════════════════════════
 

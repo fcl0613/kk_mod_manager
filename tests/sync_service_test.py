@@ -305,4 +305,92 @@ if __name__ == "__main__":
                   if m.guid == "guid.authored")
         check(am.author == "Alice", "二次同步 author 仍为 Alice（无抖动）")
 
+        # ── 用例 15~21：分类目录布局（F19）──────────────────────
+        # 前置：清场，换一套干净的 game/repo 目录与内存库
+        game2, repo2 = root / "game2", root / "repo2"
+        game2.mkdir()
+        repo2.mkdir()
+        svc = fresh_service(game2, repo2)
+
+        # ── 用例 15：{分类}/{作者}/ 无 manifest 作者 → 护栏推断 ──
+        print("[15] 分类布局无作者 → BR-CAT03 护栏推断作者 + rel path 落库")
+        cat_dir = game2 / "ForStudioScenesLoading" / "Zelwent"
+        cat_dir.mkdir(parents=True)
+        make_zipmod(cat_dir, "CatMod", "guid.cat", author=None)
+        report = svc.sync_from_disk(ModLocation.GAME)
+        svc.session.expire_all()
+        cm = next(m for m in query_mods(svc, ModLocation.GAME) if m.guid == "guid.cat")
+        check(cm.author == "Zelwent", "作者推断为 Zelwent（分类段被跳过）")
+        check(cm.author != "ForStudioScenesLoading", "分类名不会被写成作者")
+        check(cm.game_relative_path == "ForStudioScenesLoading/Zelwent/CatMod.zipmod",
+              "game_relative_path 落库为三段式相对路径")
+
+        # ── 用例 16：文件直躺分类目录 → 全段为分类 → Unknown ────
+        print("[16] 文件直躺分类目录 → author=Unknown")
+        (game2 / "MyMods").mkdir(exist_ok=True)
+        make_zipmod(game2 / "MyMods", "RootCat", "guid.root_cat", author=None)
+        svc.sync_from_disk(ModLocation.GAME)
+        svc.session.expire_all()
+        rc = next(m for m in query_mods(svc, ModLocation.GAME)
+                  if m.guid == "guid.root_cat")
+        check(rc.author == "Unknown", "无可用作者段 → Unknown")
+        check(rc.game_relative_path == "MyMods/RootCat.zipmod", "rel path 仍正确")
+
+        # ── 用例 17：护栏不受分类开关控制 ────────────────────────
+        print("[17] 分类开关关闭 → 护栏仍排除分类段（BR-CAT03）")
+        cfg.get_config().category.game_category_enabled = False
+        hide_dir = game2 / "ForCharactersLoading" / "Hider"
+        hide_dir.mkdir(parents=True)
+        make_zipmod(hide_dir, "HideMod", "guid.hide", author=None)
+        svc.sync_from_disk(ModLocation.GAME)
+        svc.session.expire_all()
+        hm = next(m for m in query_mods(svc, ModLocation.GAME) if m.guid == "guid.hide")
+        check(hm.author == "Hider", "开关关仍推断 Hider（非 ForCharactersLoading）")
+        cfg.get_config().category.game_category_enabled = True
+
+        # ── 用例 18：分类段大小写不敏感排除 ──────────────────────
+        print("[18] 磁盘分类目录大小写与清单不同 → 仍被排除")
+        low_dir = game2 / "forstudioloadingscenes" / "Omar"
+        low_dir.mkdir(parents=True)
+        make_zipmod(low_dir, "LowMod", "guid.low", author=None)
+        svc.sync_from_disk(ModLocation.GAME)
+        svc.session.expire_all()
+        lm = next(m for m in query_mods(svc, ModLocation.GAME) if m.guid == "guid.low")
+        check(lm.author == "Omar", "小写分类段被排除，作者=Omar")
+
+        # ── 用例 19：分类布局移动文件 → rel path 更新 ────────────
+        print("[19] 移动 {分类A}/ → {分类B}/ → rel path 与报告更新")
+        new_dir = game2 / "MyMods" / "Zelwent"
+        new_dir.mkdir(parents=True)
+        (cat_dir / "CatMod.zipmod").rename(new_dir / "CatMod.zipmod")
+        report = svc.sync_from_disk(ModLocation.GAME)
+        svc.session.expire_all()
+        cm = next(m for m in query_mods(svc, ModLocation.GAME) if m.guid == "guid.cat")
+        check(cm.game_relative_path == "MyMods/Zelwent/CatMod.zipmod",
+              "rel path 更新为新位置")
+        check(any(i.guid == "guid.cat" and "路径" in i.detail
+                  for i in report.updated), "报告含路径变更明细")
+        check(cm.author == "Zelwent", "作者保持 Zelwent（不因移动抖动）")
+
+        # ── 用例 20：refresh_from_disk 分类布局 ──────────────────
+        print("[20] refresh_from_disk 扫描分类布局 → 护栏 + rel path 一致")
+        count = svc.refresh_from_disk(ModLocation.GAME)
+        svc.session.expire_all()
+        cm = next(m for m in query_mods(svc, ModLocation.GAME) if m.guid == "guid.cat")
+        check(cm.game_relative_path == "MyMods/Zelwent/CatMod.zipmod",
+              "refresh 后 rel path 不变")
+        hm = next(m for m in query_mods(svc, ModLocation.GAME) if m.guid == "guid.hide")
+        check(hm.author == "Hider", "refresh 作者护栏推断一致")
+        rc = next(m for m in query_mods(svc, ModLocation.GAME)
+                  if m.guid == "guid.root_cat")
+        check(rc.author == "Unknown", "refresh 直躺分类目录 → Unknown")
+
+        # ── 用例 21：分类布局卸载 → 分类目录保留（BR-CAT06）─────
+        print("[21] 卸载分类布局 Mod → 作者目录清理、分类目录保留")
+        res = svc.uninstall(cm.id)
+        check(res.success, "卸载成功")
+        check(not (new_dir / "CatMod.zipmod").exists(), "文件已删除")
+        check(not new_dir.exists(), "作者目录 Zelwent 已清理")
+        check((game2 / "MyMods").is_dir(), "分类目录 MyMods 保留（BR-CAT06）")
+
         print(f"\nALL SYNC TESTS PASSED ({_passed} assertions)")

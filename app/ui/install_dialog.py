@@ -1,22 +1,81 @@
-"""安装确认对话框（F03-3/4 / F07）
+"""安装确认对话框（F03-3/4 / F07 / F19）
 
-需求文档 v1.3:
+需求文档 v1.5:
   - SAME_VERSION: 拒绝安装弹窗
   - NEWER_VERSION: 提示升级确认
   - OLDER_VERSION: 提示降级警告
+  - F19-4: 无卡片上下文安装时询问目标分类（角色类 / 工作室类）
+  - F19-9: 安装确认对话框显示目标分类
 """
 
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QFrame,
+    QLabel, QPushButton, QFrame, QRadioButton,
 )
 from PyQt6.QtCore import Qt
 
+from app.config import get_config
 from app.services.manifest_service import (
     ModManifest,
     DuplicateReport,
     DuplicateResult,
 )
+
+
+class CategoryChoiceDialog(QDialog):
+    """安装目标分类选择对话框（F19-4）
+
+    无卡片上下文的安装入口（拖拽 zipmod / 手动安装）弹出，
+    询问安装到角色类还是工作室类分类；两类落点取自设置。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        cfg = get_config().category
+        self._chara = cfg.category_chara
+        self._studio = cfg.category_studio
+
+        self.setWindowTitle("选择安装分类")
+        self.setMinimumWidth(400)
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        title = QLabel("该 Mod 安装到哪个分类？")
+        title.setObjectName("title")
+        layout.addWidget(title)
+
+        hint = QLabel(
+            "无卡片上下文，无法自动判断使用场景（F19-4）。\n"
+            "角色类：人物卡 / 服装卡依赖；工作室类：场景卡【工作室】依赖。"
+        )
+        hint.setObjectName("subtitle")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.chara_radio = QRadioButton(f"角色类（{self._chara}）")
+        self.chara_radio.setChecked(True)
+        layout.addWidget(self.chara_radio)
+
+        self.studio_radio = QRadioButton(f"工作室类（{self._studio}）")
+        layout.addWidget(self.studio_radio)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+        ok_btn = QPushButton("确定")
+        ok_btn.setObjectName("primary")
+        ok_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(ok_btn)
+        layout.addLayout(btn_layout)
+
+    @property
+    def selected(self) -> str:
+        """所选目标分类目录名"""
+        return self._studio if self.studio_radio.isChecked() else self._chara
 
 
 class InstallConfirmDialog(QDialog):
@@ -28,11 +87,13 @@ class InstallConfirmDialog(QDialog):
         dup_report: DuplicateReport,
         action_name: str = "安装",
         parent=None,
+        target_category: str = "",
     ):
         super().__init__(parent)
         self.manifest = manifest
         self.dup_report = dup_report
         self.action_name = action_name
+        self.target_category = target_category  # F19 目标分类（空 = 平铺布局）
         self.confirm_upgrade = False
         self.confirm_downgrade = False
         self._setup_ui()
@@ -73,6 +134,12 @@ class InstallConfirmDialog(QDialog):
         self._add_field(info_layout, "名称", self.manifest.name)
         self._add_field(info_layout, "GUID", self.manifest.guid)
         self._add_field(info_layout, "作者", self.manifest.display_author)
+        if self.target_category:
+            # F19-9：显示目标分类（三段式布局）
+            self._add_field(
+                info_layout, "目标分类",
+                f"{self.target_category}/{self.manifest.display_author}",
+            )
 
         if self.dup_report.result == DuplicateResult.SAME_VERSION:
             self._add_field(

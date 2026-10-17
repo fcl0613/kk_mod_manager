@@ -46,6 +46,7 @@ def test_to_dict_fields(db_session):
     ts = datetime(2024, 5, 1, 12, 30, 0)
     mod = _mod(
         author="Alice", notes="备注", repo_relative_path="Alice/ModX.zipmod",
+        game_relative_path="ForCharactersLoading/Alice/ModX.zipmod",
         installed_at=ts,
     )
     db_session.add(mod)
@@ -55,12 +56,21 @@ def test_to_dict_fields(db_session):
     assert set(d.keys()) == {
         "id", "guid", "name", "version", "author", "description", "website",
         "file_name", "location", "status", "installed_at", "notes",
-        "repo_relative_path",
+        "repo_relative_path", "game_relative_path",
     }
     assert d["location"] == "game"
     assert d["status"] == "enabled"
     assert d["installed_at"] == ts.isoformat()
     assert d["notes"] == "备注"
+    assert d["game_relative_path"] == "ForCharactersLoading/Alice/ModX.zipmod"
+
+
+def test_game_relative_path_default_empty(db_session):
+    """F19-6：新列默认空串（老数据回退作者目录公式定位）"""
+    mod = _mod()
+    db_session.add(mod)
+    db_session.commit()
+    assert mod.game_relative_path == ""
 
 
 def test_to_dict_installed_at_none_gets_default(db_session):

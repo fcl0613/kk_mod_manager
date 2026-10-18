@@ -9,6 +9,7 @@
   - UI 主题: 暗色/亮色
   - 行为配置: 卸载前确认、清理空目录
   - 分类目录（F19）: 安装开关、分类清单、角色类/工作室类落点
+  - Sideloader 日志路径（F23）: BepInEx LogOutput.log，自动探测失败时由用户指定
 """
 
 from pathlib import Path
@@ -85,6 +86,13 @@ class AppConfig(BaseModel):
     repo_path: str = Field(
         default="",
         description="本地 Mod 仓库路径（Mod 收藏目录）"
+    )
+
+    # ── Sideloader 日志（F23）──
+    sideloader_log_path: str = Field(
+        default="",
+        description="BepInEx LogOutput.log 路径（从游戏日志读取缺失；"
+                    "自动探测失败时由用户指定一次，设置页可改，留空回到自动探测）",
     )
 
     # ── 远程仓库（P2）──

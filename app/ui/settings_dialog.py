@@ -1,4 +1,4 @@
-"""设置对话框（F01 / F16 / F19）
+"""设置对话框（F01 / F16 / F19 / F23）
 
 需求文档 v1.5:
   - 游戏 Mod 路径配置（F01）
@@ -6,6 +6,7 @@
   - 远程仓库 URL 配置（F16，P2，可选）
   - 行为配置：卸载前确认、清理空目录
   - 分类目录配置（F19）：安装开关、分类清单、角色类/工作室类落点
+  - Sideloader 日志路径（F23）：BepInEx LogOutput.log，留空自动探测
   - 主题选择
 """
 
@@ -59,6 +60,18 @@ class SettingsDialog(QDialog):
         self.repo_browse_btn.clicked.connect(self._browse_repo_path)
         repo_layout.addWidget(self.repo_browse_btn)
         path_form.addRow("本地仓库路径:", repo_layout)
+
+        # BepInEx 游戏日志路径（F23：从游戏日志读取缺失）
+        sidelog_layout = QHBoxLayout()
+        self.sidelog_path_edit = QLineEdit()
+        self.sidelog_path_edit.setPlaceholderText(
+            "留空 = 按 Mod 目录布局自动探测 BepInEx/LogOutput.log..."
+        )
+        sidelog_layout.addWidget(self.sidelog_path_edit)
+        self.sidelog_browse_btn = QPushButton("浏览...")
+        self.sidelog_browse_btn.clicked.connect(self._browse_sideloader_log_path)
+        sidelog_layout.addWidget(self.sidelog_browse_btn)
+        path_form.addRow("游戏日志文件:", sidelog_layout)
 
         layout.addWidget(path_group)
 
@@ -204,6 +217,7 @@ class SettingsDialog(QDialog):
         cfg = self._config
         self.game_path_edit.setText(cfg.game_mod_path)
         self.repo_path_edit.setText(cfg.repo_path)
+        self.sidelog_path_edit.setText(cfg.sideloader_log_path)
         self.remote_url_edit.setText(cfg.remote_repo_url)
         self.confirm_uninstall_cb.setChecked(cfg.confirm_before_uninstall)
         self.clean_empty_cb.setChecked(cfg.clean_empty_dirs)
@@ -233,6 +247,17 @@ class SettingsDialog(QDialog):
         if path:
             self.repo_path_edit.setText(path)
 
+    def _browse_sideloader_log_path(self):
+        """选择 BepInEx 日志文件（F23；留空回到自动探测）"""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择 BepInEx 日志文件",
+            self.sidelog_path_edit.text() or str(Path.home()),
+            "日志文件 (*.log);;所有文件 (*.*)",
+        )
+        if path:
+            self.sidelog_path_edit.setText(path)
+
     def _save(self):
         """保存配置"""
         # 基本校验
@@ -251,6 +276,8 @@ class SettingsDialog(QDialog):
         # 更新配置
         self._config.game_mod_path = game_path
         self._config.repo_path = repo_path
+        # 留空 = 回到自动探测（F23-2）
+        self._config.sideloader_log_path = self.sidelog_path_edit.text().strip()
         self._config.remote_repo_url = remote_url
         self._config.confirm_before_uninstall = self.confirm_uninstall_cb.isChecked()
         self._config.clean_empty_dirs = self.clean_empty_cb.isChecked()

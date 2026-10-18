@@ -3,8 +3,12 @@
 布局参考 card_result_dialog，修改点：
   - mod 列表列改为: GUID | Mod名称 | 状态 | 操作
   - 不再弹出对话框，结果内嵌展示
+  - 游戏日志模式（F23）：「🎮 从游戏日志读取缺失」按钮解析 BepInEx
+    LogOutput.log 的缺失 / 过旧警告，复用 🟢🟡🔴 分组与补装交互，
+    左列改为展示日志来源信息（无卡面）
 """
 
+from datetime import datetime
 from pathlib import Path
 from collections.abc import Callable
 
@@ -18,7 +22,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QSize
 from PyQt6.QtGui import QPixmap, QDragEnterEvent, QDropEvent
 from loguru import logger
 
-from app.config import get_config
+from app.config import get_config, save_config
 from app.utils.version_utils import display_version
 from app.services.card_service import (
     CardModItem,
@@ -26,6 +30,11 @@ from app.services.card_service import (
     CardModStatus,
     GameVersion,
     SceneSummary,
+)
+from app.services.sideloader_log_service import (
+    LogEntryKind,
+    LogMissingEntry,
+    SideloaderLogService,
 )
 
 
@@ -41,6 +50,8 @@ class CardParsePage(QWidget):
     card_dropped = pyqtSignal(Path)
     # 信号：请求将二代卡转换为一代卡（输入路径, 输出路径）
     convert_to_kk_requested = pyqtSignal(Path, Path)
+    # 信号：请求解析游戏日志的缺失 / 过旧警告（日志路径，F23）
+    game_log_requested = pyqtSignal(Path)
 
     INSTALLED_COLOR = "#a6e3a1"
     IN_REPO_COLOR = "#f9e2af"
@@ -68,6 +79,9 @@ class CardParsePage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._result: CardParseResult | None = None
+        # 游戏日志模式（F23）：True 时 _result 为日志解析结果
+        self._log_mode = False
+        self._log_entries: dict[str, LogMissingEntry] = {}  # guid → 日志条目
         self._setup_ui()
 
     # ═══════════════════════════════════════════════════════
@@ -90,6 +104,16 @@ class CardParsePage(QWidget):
         self.drop_zone.setObjectName("cardDropZone")
         self.drop_zone.setAcceptDrops(True)
         top_bar.addWidget(self.drop_zone, 1)
+
+        # 从游戏日志读取缺失（F23-1）：BepInEx LogOutput.log 的缺失 / 过旧警告
+        self.read_log_btn = QPushButton("🎮 从游戏日志读取缺失")
+        self.read_log_btn.setFixedHeight(50)
+        self.read_log_btn.setToolTip(
+            "读取 BepInEx LogOutput.log 中 Sideloader 报告的缺失 / 过旧 Mod，"
+            "对照本地库标注状态。\n警告仅在游戏内实际加载含缺失依赖的卡 / 场景时产生。"
+        )
+        self.read_log_btn.clicked.connect(self._on_read_game_log)
+        top_bar.addWidget(self.read_log_btn)
 
         select_btn = QPushButton("📂 选择卡片")
         select_btn.setObjectName("primary")
@@ -296,14 +320,94 @@ class CardParsePage(QWidget):
         self.drop_zone.setText(f"正在解析：{card_path.name}...")
         self.card_dropped.emit(card_path)
 
+    # ═══════════════════════════════════════════════════════
+    # 游戏日志读取（F23）
+    # ═══════════════════════════════════════════════════════
+
+    def _on_read_game_log(self):
+        """「🎮 从游戏日志读取缺失」入口（F23-1 / F23-2）。
+
+        路径解析顺序：config 已存路径（文件存在才用，失效自愈回探测）
+        → 按 game_mod_path 常见布局自动探测 → 引导用户选择一次并写回 config。
+        """
+        config = get_config()
+        configured = (config.sideloader_log_path or "").strip()
+        if configured:
+            configured_path = Path(configured)
+            if configured_path.is_file():
+                self._emit_game_log(configured_path)
+                return
+            logger.warning("配置的游戏日志路径不存在，重新探测: {}", configured)
+
+        detected = SideloaderLogService.detect_log_path(config)
+        if detected is not None:
+            self._persist_log_path(detected, config)
+            self._emit_game_log(detected)
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "未找到游戏日志",
+            "未能自动定位 BepInEx 的 LogOutput.log"
+            "（游戏根目录与 Mod 目录可能分离）。\n\n"
+            "日志通常位于：{游戏根目录}\\BepInEx\\LogOutput.log\n\n"
+            "是否手动选择日志文件？（选择一次后将记住路径，设置页可修改）",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择 BepInEx 日志文件",
+            "",
+            "日志文件 (*.log);;所有文件 (*.*)",
+        )
+        if not file_path:
+            return
+        self._persist_log_path(Path(file_path), config)
+        self._emit_game_log(Path(file_path))
+
+    def _persist_log_path(self, path: Path, config) -> None:
+        """把解析到的日志路径写回 config（F23-2：探测 / 选择一次即持久化）"""
+        if config.sideloader_log_path != str(path):
+            config.sideloader_log_path = str(path)
+            save_config(config)
+            logger.info("游戏日志路径已写入配置: {}", path)
+
+    def _emit_game_log(self, path: Path):
+        """发射日志解析请求信号给 MainWindow"""
+        logger.info("读取游戏日志: {}", path)
+        self.drop_zone.setText(f"正在读取游戏日志：{path.name}...")
+        self.game_log_requested.emit(path)
+
     def set_card_result(self, result: CardParseResult):
         """由 MainWindow 调用，展示解析结果"""
         self._result = result
+        self._log_mode = False
+        self._log_entries = {}
         self._populate()
+
+    def set_log_result(
+            self,
+            result: CardParseResult,
+            entries: dict[str, LogMissingEntry],
+    ):
+        """由 MainWindow 调用，展示游戏日志解析结果（F23-1，复用 F15 展示）"""
+        self._result = result
+        self._log_mode = True
+        self._log_entries = entries
+        self._populate()
+
+    @property
+    def is_log_mode(self) -> bool:
+        """当前展示的是否为游戏日志结果（MainWindow 据此选择刷新方式）"""
+        return self._log_mode
 
     def clear_result(self):
         """清空解析结果"""
         self._result = None
+        self._log_mode = False
+        self._log_entries = {}
         self.tree.clear()
         self.image_label.setText("暂无卡片")
         self.card_name_label.setText("")
@@ -327,6 +431,10 @@ class CardParsePage(QWidget):
             return
 
         self.tree.clear()
+
+        if self._log_mode:
+            self._populate_log()
+            return
 
         # 更新拖放区
         self.drop_zone.setText(f"📋 当前卡片：{self._result.card_name}  （拖入新卡片重新解析）")
@@ -447,6 +555,135 @@ class CardParsePage(QWidget):
         self._update_stats()
 
         # 按钮可见性
+        self.install_all_btn.setVisible(len(in_repo) > 0)
+        self.copy_missing_btn.setVisible(len(missing) > 0)
+
+    def _populate_log(self):
+        """填充游戏日志解析结果（F23）：左列展示日志来源信息，右侧复用状态分组"""
+        result = self._result
+        if result is None:
+            return
+
+        self.drop_zone.setText("📋 当前：游戏日志缺失分析  （拖入新卡片重新解析）")
+
+        # 左列：无卡面，展示日志来源信息
+        self.image_label.setPixmap(QPixmap())
+        self.image_label.setText("📄\nLogOutput.log")
+        self.card_name_label.setText("Sideloader 运行日志")
+        log_path = result.card_path
+        parent_str = str(log_path.parent)
+        if len(parent_str) > 30:
+            parent_str = "…" + parent_str[-29:]
+        self.card_type_label.setText(f"来源：{parent_str}")
+        self.card_type_label.setToolTip(str(log_path))
+        try:
+            mtime = datetime.fromtimestamp(log_path.stat().st_mtime)
+            self.game_version_label.setText(f"日志时间：{mtime:%Y-%m-%d %H:%M}")
+        except OSError:
+            self.game_version_label.setText("")
+        self.scene_summary_label.setText("")
+        self.scene_summary_label.setToolTip("")
+        self.convert_to_kk_btn.setVisible(False)
+
+        installed = [m for m in result.mods
+                     if m.status == CardModStatus.INSTALLED]
+        in_repo = [m for m in result.mods
+                   if m.status == CardModStatus.IN_REPO]
+        missing = [m for m in result.mods
+                   if m.status == CardModStatus.MISSING]
+
+        # 🟢 已安装分组（日志判过旧的行带 ⚠ 标注，F23-3）
+        if installed:
+            group = self._add_group(
+                f"🟢 已安装（{len(installed)} 个）",
+                self.INSTALLED_COLOR,
+            )
+            for item in installed:
+                entry = self._log_entries.get(item.guid)
+                info = f"{item.mod_author}/{item.mod_name} {display_version(item.mod_version)}"
+
+                if entry is not None and entry.kind is LogEntryKind.OUTDATED:
+                    if item.repo_mod_id is not None:
+                        # 仓库有更新版：同卡片页 ⬆ 角标，可直接升级（F15-13 复用）
+                        info += f" → 仓库 {display_version(item.repo_version)}"
+                        self._add_item(
+                            group, item.guid, info, "🟢 ⚠过旧 ⬆", "升级",
+                            card_item=item,
+                            tooltip=(
+                                "日志判定版本过旧（卡所需槽位未找到）："
+                                f"游戏 {display_version(item.mod_version)} → "
+                                f"仓库 {display_version(item.repo_version)}，可升级"
+                            ),
+                        )
+                    else:
+                        self._add_item(
+                            group, item.guid, info, "🟢 ⚠过旧", "",
+                            tooltip=(
+                                "游戏已装该 Mod，但日志判定版本过旧"
+                                "（卡所需槽位未找到）。\n"
+                                "仓库无更新版本：可运行「数据 ▾ 仓库版本巡检」，"
+                                "或按线索手动获取新版。"
+                            ),
+                        )
+                    continue
+
+                if entry is not None and entry.kind is LogEntryKind.MISSING:
+                    # 日志来自上次会话且报缺失，现库中已装：多为禁用态
+                    # （禁用的 zipmod 不被 Sideloader 加载）或安装后日志未更新
+                    self._add_item(
+                        group, item.guid, info, "🟢 已装*", "",
+                        tooltip=(
+                            "日志报缺失但本地库中已装：该 Mod 可能处于禁用状态"
+                            "（禁用的 zipmod 不被 Sideloader 加载，"
+                            "启用后进游戏验证），\n"
+                            "或为安装后日志尚未更新（日志只反映上次游戏会话）。"
+                        ),
+                    )
+                    continue
+
+                self._add_item(group, item.guid, info, "🟢 已装", "")
+
+        # 🟡 仓库有分组（可一键补装，复用 F15 交互）
+        if in_repo:
+            group = self._add_group(
+                f"🟡 仓库有，可安装（{len(in_repo)} 个）",
+                self.IN_REPO_COLOR,
+            )
+            for item in in_repo:
+                info = f"{item.mod_author}/{item.mod_name} {display_version(item.mod_version)}"
+                self._add_item(
+                    group, item.guid, info, "🟡 仓库有", "安装",
+                    card_item=item,
+                )
+
+        # 🔴 缺失分组（展示日志携带的 website 等线索，F23-5）
+        if missing:
+            group = self._add_group(
+                f"🔴 缺失（{len(missing)} 个）",
+                self.MISSING_COLOR,
+            )
+            for item in missing:
+                info = " · ".join(filter(None, [
+                    item.meta_name, item.meta_author, item.meta_website,
+                ]))
+                self._add_item(group, item.guid, info, "🔴 缺失", "")
+
+        self.tree.expandAll()
+
+        outdated_count = sum(
+            1 for m in installed
+            if (e := self._log_entries.get(m.guid)) is not None
+            and e.kind is LogEntryKind.OUTDATED
+        )
+        self.stats_label.setText(
+            f"总计：{result.total_count}  |  "
+            f"🟢 已装：{result.installed_count}"
+            + (f"（⚠过旧 {outdated_count}）" if outdated_count else "")
+            + f"  |  🟡 仓库有：{result.in_repo_count}  |  "
+            f"🔴 缺失：{result.missing_count}"
+        )
+        self.stats_label.setStyleSheet("")
+
         self.install_all_btn.setVisible(len(in_repo) > 0)
         self.copy_missing_btn.setVisible(len(missing) > 0)
 

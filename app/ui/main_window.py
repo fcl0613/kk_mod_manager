@@ -28,6 +28,11 @@ from app.database import init_db, get_session, get_db_path
 from app.models.mod import Mod, ModLocation, ModStatus, OperationLog
 from app.services.mod_service import ModService, InstallResult
 from app.services.card_service import CardService, CardParseResult
+from app.services.sideloader_log_service import (
+    LogEntryKind,
+    LogMissingEntry,
+    SideloaderLogService,
+)
 from app.ui.settings_dialog import SettingsDialog
 from app.ui.install_dialog import InstallConfirmDialog, CategoryChoiceDialog
 from app.ui.mod_detail_panel import ModDetailPanel
@@ -69,6 +74,11 @@ class MainWindow(QMainWindow):
         init_db()
         self._mod_service = ModService(get_session())
         self._card_service = CardService()
+        self._sideloader_log_service = SideloaderLogService()
+
+        # 游戏日志解析状态（F23）：最近一次日志来源与其结果视图
+        self._log_path: Path | None = None
+        self._log_view: tuple[CardParseResult, dict[str, LogMissingEntry]] | None = None
 
         # 卡片解析后台线程（F17-11；同一时刻仅一次解析）
         self._card_parse_thread: QThread | None = None
@@ -122,6 +132,7 @@ class MainWindow(QMainWindow):
         self.card_page.reparse_requested.connect(self._on_card_page_reparse)
         self.card_page.card_dropped.connect(self._parse_card)
         self.card_page.convert_to_kk_requested.connect(self._on_convert_to_kk)
+        self.card_page.game_log_requested.connect(self._on_game_log_parse)
         self.page_stack.addWidget(self.card_page)
 
         main_layout.addWidget(self.page_stack, 1)
@@ -332,8 +343,12 @@ class MainWindow(QMainWindow):
             # 切换到 Mod 管理页
             self._refresh_current()
         elif index == 1:
-            # 切换到解析卡片页
-            if self._card_result is not None:
+            # 切换到解析卡片页：按页面当前模式回填最近一次结果
+            if self.card_page.is_log_mode:
+                if self._log_view is not None:
+                    result, entries = self._log_view
+                    self.card_page.set_log_result(result, entries)
+            elif self._card_result is not None:
                 self.card_page.set_card_result(self._card_result)
 
     def switch_to_card_page(self):
@@ -509,6 +524,95 @@ class MainWindow(QMainWindow):
             self._card_result = result
         return self._card_result
 
+    # ═══════════════════════════════════════════════════════
+    # 游戏日志解析（F23）
+    # ═══════════════════════════════════════════════════════
+
+    def _on_game_log_parse(self, log_path: Path):
+        """卡片页「🎮 从游戏日志读取缺失」：解析 + 对照本地库并展示（F23-1）"""
+        logger.info("开始解析游戏日志: {}", log_path)
+        self.status_bar.showMessage(f"正在解析游戏日志：{log_path.name}...")
+
+        try:
+            result, entries = self._sideloader_log_service.analyze(
+                log_path,
+                self._mod_service.session,
+                self._card_service,
+            )
+        except Exception as e:  # noqa: BLE001 - 兜底回传 UI
+            logger.exception("游戏日志解析异常")
+            QMessageBox.critical(self, "日志解析出错", f"解析游戏日志时发生错误：\n{e}")
+            self.status_bar.clearMessage()
+            self.card_page.drop_zone.setText(
+                "🎴 拖入角色卡/服装卡/场景卡 (PNG) 进行 Mod 依赖分析"
+            )
+            return
+
+        if not result.mods:
+            self.status_bar.clearMessage()
+            self.status_bar.showMessage("游戏日志中未发现缺失 / 过旧的 Mod 警告", 5000)
+            QMessageBox.information(
+                self,
+                "没有发现缺失",
+                "日志中未发现 Sideloader 的缺失 / 过旧警告。\n\n"
+                "提示：警告只在游戏内实际加载含缺失依赖的卡 / 场景时产生，\n"
+                "仅进入主菜单不会触发。",
+            )
+            self.card_page.drop_zone.setText(
+                "🎴 拖入角色卡/服装卡/场景卡 (PNG) 进行 Mod 依赖分析"
+            )
+            return
+
+        self._log_path = log_path
+        self._log_view = (result, entries)
+        self.card_page.set_log_result(result, entries)
+        self.switch_to_card_page()
+
+        outdated = sum(1 for e in entries.values() if e.kind is LogEntryKind.OUTDATED)
+        logger.info(
+            "游戏日志解析完成: {} - 总 GUID={} 已装={} 过旧={} 仓库有={} 缺失={}",
+            log_path.name,
+            result.total_count, result.installed_count, outdated,
+            result.in_repo_count, result.missing_count,
+        )
+        self.status_bar.showMessage(
+            f"日志解析完成：{result.total_count} 个 GUID | "
+            f"已装 {result.installed_count}"
+            + (f"（⚠过旧 {outdated}）" if outdated else "")
+            + f" | 仓库有 {result.in_repo_count} | "
+            f"缺失 {result.missing_count}"
+        )
+
+    def refresh_log_result(self) -> CardParseResult | None:
+        """重读日志并重查本地库（安装 / 升级后刷新，F23）。
+
+        日志文件本身只反映上次游戏会话，重新对照后新装的 Mod 会
+        从 🟡/🔴 转为 🟢（并带「已装*」说明）。
+        """
+        if self._log_path is None:
+            return None
+        try:
+            result, entries = self._sideloader_log_service.analyze(
+                self._log_path,
+                self._mod_service.session,
+                self._card_service,
+            )
+        except Exception:  # noqa: BLE001 - 刷新失败不阻断安装流程
+            logger.exception("刷新日志结果失败")
+            return None
+        self._log_view = (result, entries)
+        self.card_page.set_log_result(result, entries)
+        return result
+
+    def _refresh_card_or_log(self) -> CardParseResult | None:
+        """按卡片页当前模式刷新结果：日志模式重查库，卡片模式重解析卡片"""
+        if self.card_page.is_log_mode:
+            return self.refresh_log_result()
+        new_result = self.reparse_card()
+        if new_result is not None:
+            self.card_page.set_card_result(new_result)
+        return new_result
+
     def install_repo_mod(self, mod_id: int, category: str | None = None) -> tuple[bool, str]:
         """从仓库安装 Mod 到游戏（供卡片结果面板调用；category 为 F19 目标分类）"""
         result = self._mod_service.install_from_repo(mod_id, category=category)
@@ -531,16 +635,12 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "安装结果", msg)
 
         if success:
-            # 重新解析卡片并刷新页面
-            new_result = self.reparse_card()
-            if new_result:
-                self.card_page.set_card_result(new_result)
+            # 按当前模式刷新：卡片重解析 / 日志重查库（F23）
+            self._refresh_card_or_log()
 
     def _on_card_page_reparse(self):
-        """卡片解析页：请求重新解析（全部安装后）"""
-        new_result = self.reparse_card()
-        if new_result:
-            self.card_page.set_card_result(new_result)
+        """卡片解析页：请求重新解析（全部安装后；日志模式重查库，F23）"""
+        self._refresh_card_or_log()
 
     def _on_convert_to_kk(self, input_path: Path, output_path: Path):
         """卡片解析页：将二代卡（KKS）转换为一代卡（KK）"""

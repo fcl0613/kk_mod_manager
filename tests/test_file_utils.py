@@ -102,6 +102,17 @@ def test_safe_copy_uppercase_zipmod_suffix(tmp_path):
     assert result.name == "ModCv1.0.0.zipmod"
 
 
+def test_safe_copy_src_already_in_place(tmp_path):
+    """源文件已在目标位置（对仓库目录内的文件执行「添加到仓库」）→ 原地生效
+
+    不自拷贝：修复前会产出 "{文件名}v{版本}.zipmod" 副本与源文件并存。
+    """
+    src = _touch(tmp_path / "ModA.zipmod", "same")
+    result = safe_copy(src, tmp_path, "ModA.zipmod", "2.0.0")
+    assert result == src
+    assert list(tmp_path.glob("*.zipmod")) == [src]
+
+
 # ── safe_copy_simple / delete_file ──────────────────────────
 
 def test_safe_copy_simple_overwrites_and_creates_parent(tmp_path):

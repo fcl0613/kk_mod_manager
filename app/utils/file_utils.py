@@ -54,6 +54,11 @@ def safe_copy(
 
     target = dst_dir / file_name
 
+    # 源文件已在目标位置（如对仓库目录内的文件执行「添加到仓库」）
+    # → 原地生效，避免自拷贝出带版本后缀的副本
+    if src.resolve() == target.resolve():
+        return target
+
     if not target.exists():
         shutil.copy2(src, target)
         return target

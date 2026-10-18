@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QPushButton, QLineEdit, QLabel,
     QTreeWidget, QTreeWidgetItem, QSplitter,
-    QTabWidget, QTabBar, QStackedWidget,
+    QTabWidget, QTabBar, QStackedWidget, QDockWidget,
     QStatusBar, QFileDialog, QMessageBox, QProgressDialog,
     QToolButton, QMenu,
 )
@@ -140,11 +140,10 @@ class MainWindow(QMainWindow):
         self.card_page.game_log_requested.connect(self._on_game_log_parse)
         self.page_stack.addWidget(self.card_page)
 
-        # Page 2: 操作日志页面（F10-3）
-        self.log_page = OperationLogPage(self._mod_service)
-        self.page_stack.addWidget(self.log_page)
-
         main_layout.addWidget(self.page_stack, 1)
+
+        # ── 底部停靠面板：操作日志（F10-3）──
+        self._create_log_dock()
 
         # ── 状态栏 ──
         self.status_bar = QStatusBar()
@@ -156,7 +155,6 @@ class MainWindow(QMainWindow):
         self.top_tab_bar = QTabBar()
         self.top_tab_bar.addTab("📦 Mod 管理")
         self.top_tab_bar.addTab("📋 解析卡片")
-        self.top_tab_bar.addTab("📜 操作日志")
         self.top_tab_bar.currentChanged.connect(self._on_top_tab_changed)
 
         # 设置 TabBar 样式
@@ -252,6 +250,14 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
+        # 操作日志（开关式，控制底部停靠面板，F10-3）
+        self.log_btn = QToolButton()
+        self.log_btn.setText("📜")
+        self.log_btn.setToolTip("操作日志（Ctrl+L）")
+        self.log_btn.setCheckable(True)
+        self.log_btn.clicked.connect(self._toggle_log_dock)
+        toolbar.addWidget(self.log_btn)
+
         # 设置（图标式）
         settings_btn = QToolButton()
         settings_btn.setText("⚙")
@@ -273,6 +279,10 @@ class MainWindow(QMainWindow):
         search_sc = QShortcut(QKeySequence("Ctrl+F"), self)
         search_sc.activated.connect(self.search_edit.setFocus)
         search_sc.activated.connect(self.search_edit.selectAll)
+
+        log_sc = QShortcut(QKeySequence("Ctrl+L"), self)
+        log_sc.activated.connect(
+            lambda: self._toggle_log_dock(not self.log_dock.isVisible()))
 
     def _create_left_panel(self) -> QWidget:
         """创建左侧面板（Tab 切换游戏/仓库的 Mod 列表）"""
@@ -361,9 +371,38 @@ class MainWindow(QMainWindow):
                     self.card_page.set_log_result(result, entries)
             elif self._card_result is not None:
                 self.card_page.set_card_result(self._card_result)
-        elif index == 2:
-            # 切换到操作日志页：拉最新日志（F10-3）
+
+    # ═══════════════════════════════════════════════════════
+    # 操作日志停靠面板（F10-3）
+    # ═══════════════════════════════════════════════════════
+
+    def _create_log_dock(self):
+        """创建底部停靠面板：操作日志（默认隐藏，工具栏 📜 / Ctrl+L 开关）"""
+        self.log_page = OperationLogPage(self._mod_service)
+
+        self.log_dock = QDockWidget("📜 操作日志", self)
+        self.log_dock.setWidget(self.log_page)
+        self.log_dock.setAllowedAreas(
+            Qt.DockWidgetArea.BottomDockWidgetArea | Qt.DockWidgetArea.TopDockWidgetArea
+        )
+        self.log_dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetClosable
+            | QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+        )
+        self.log_dock.visibilityChanged.connect(self._on_log_dock_visibility)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.log_dock)
+        self.log_dock.hide()
+
+    def _on_log_dock_visibility(self, visible: bool):
+        """停靠面板可见性变化：同步工具栏按钮勾选态；打开时拉最新日志"""
+        self.log_btn.setChecked(visible)
+        if visible:
             self.log_page.refresh()
+
+    def _toggle_log_dock(self, checked: bool):
+        """工具栏 📜 按钮 / Ctrl+L：开关停靠面板"""
+        self.log_dock.setVisible(checked)
 
     def switch_to_card_page(self):
         """切换到卡片解析页面"""
@@ -960,10 +999,7 @@ class MainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════
 
     def _refresh_current(self):
-        """刷新当前页面的列表（Mod 管理页按内层 Tab；日志页直接刷新）"""
-        if self.page_stack.currentIndex() == 2:
-            self.log_page.refresh()
-            return
+        """刷新当前页面的列表（Mod 管理页按内层 Tab）"""
         idx = self.tab_widget.currentIndex()
         if idx == 0:
             self._refresh_game_list()

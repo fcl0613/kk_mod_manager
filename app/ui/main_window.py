@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import (
     QStatusBar, QFileDialog, QMessageBox, QProgressDialog,
     QToolButton, QMenu,
 )
-from PyQt6.QtCore import Qt, QSize, QTimer, QThread
+from PyQt6.QtCore import Qt, QSize, QTimer, QThread, QRect, QEvent
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QShortcut, QKeySequence
 from loguru import logger
 
@@ -391,8 +391,45 @@ class MainWindow(QMainWindow):
             | QDockWidget.DockWidgetFeature.DockWidgetFloatable
         )
         self.log_dock.visibilityChanged.connect(self._on_log_dock_visibility)
+        self.log_dock.topLevelChanged.connect(self._on_log_dock_top_level)
+        self.log_dock.installEventFilter(self)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.log_dock)
         self.log_dock.hide()
+        # 浮动前的坞内高度 / 用户浮动几何（回坞、再浮动时复原，见下）
+        self._log_dock_height: int | None = None
+        self._log_float_geometry: QRect | None = None
+
+    def _on_log_dock_top_level(self, floating: bool):
+        """浮动/回坞切换：双向复原几何。
+
+        Qt 只有一份几何记忆且回坞会把浮动窗口尺寸带进坞内：
+        - 回坞：底部面板高度被浮动尺寸顶掉 → 浮动瞬间记住坞内高度，
+          回坞后延迟一拍（等主窗口布局完成）用 resizeDocks 复原；
+          但复原会反过来覆盖 Qt 记住的浮动几何 →
+        - 再浮动：用事件过滤器在浮动期间记下的用户几何主动还原。
+        """
+        if floating:
+            self._log_dock_height = self.log_dock.height()
+            if self._log_float_geometry is not None:
+                geo = QRect(self._log_float_geometry)
+                QTimer.singleShot(0, lambda: self.log_dock.setGeometry(geo))
+        elif self._log_dock_height is not None:
+            h = self._log_dock_height
+            QTimer.singleShot(
+                0,
+                lambda: self.resizeDocks(
+                    [self.log_dock], [h], Qt.Orientation.Vertical),
+            )
+
+    def eventFilter(self, obj, event):
+        """记录日志面板浮动期间的用户几何（Move/Resize），供再浮动时还原"""
+        if (
+            obj is self.log_dock
+            and self.log_dock.isFloating()
+            and event.type() in (QEvent.Type.Move, QEvent.Type.Resize)
+        ):
+            self._log_float_geometry = QRect(self.log_dock.geometry())
+        return super().eventFilter(obj, event)
 
     def _on_log_dock_visibility(self, visible: bool):
         """停靠面板可见性变化：同步工具栏按钮勾选态；打开时拉最新日志"""

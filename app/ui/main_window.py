@@ -693,18 +693,18 @@ class MainWindow(QMainWindow):
             "OLDER_VERSION_NEEDS_CONFIRM",
         ):
             # 需要用户确认升级/降级
-            if result.dup_report is None or result.manifest is None:
+            if result.duplicate_report is None or result.manifest is None:
                 QMessageBox.warning(self, "错误", "内部错误：缺少重复检测报告")
                 return
 
             action = "安装" if (
-                result.dup_report.existing_mod is not None
-                and result.dup_report.existing_mod.location == ModLocation.GAME
+                result.duplicate_report.existing_mod is not None
+                and result.duplicate_report.existing_mod.location == ModLocation.GAME
             ) else "添加"
 
             dialog = InstallConfirmDialog(
                 result.manifest,
-                result.dup_report,
+                result.duplicate_report,
                 action_name=action,
                 parent=self,
                 target_category=self._pending_category or "",

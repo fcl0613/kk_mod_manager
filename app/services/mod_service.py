@@ -1661,6 +1661,10 @@ class ModService:
         if deleted:
             self.session.commit()
             logger.info("清理过期操作日志: 删除 {} 行（保留近 {} 天）", deleted, days)
+        else:
+            # 0 行也必须收尾：DELETE 已开启写事务，悬挂在长期存活的会话上
+            # 会占住 SQLite 写锁，把后续其它连接（同步/安装 worker）锁死
+            self.session.rollback()
         return deleted
 
     def group_by_author(

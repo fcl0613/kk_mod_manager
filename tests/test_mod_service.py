@@ -1114,12 +1114,16 @@ class TestOperationLogs:
         deleted = svc.cleanup_old_logs()
 
         assert deleted == 1
+        assert not svc.session.in_transaction()  # commit 路径同样收尾（写锁释放）
         remaining = [l.mod_name for l in svc.get_operation_logs()]
         assert remaining == ["Today", "Fresh"]
 
-    def test_cleanup_no_match_returns_zero_without_commit(self, svc):
+    def test_cleanup_no_match_still_ends_transaction(self, svc):
+        """0 行删除也必须收尾事务：DELETE 已开启写事务，悬挂在长期存活的
+        会话上会占住 SQLite 写锁，锁死其它连接（同步/安装 worker）的写"""
         _seed_log(svc, name="Fresh", created_at=datetime.now())
         assert svc.cleanup_old_logs() == 0
+        assert not svc.session.in_transaction()
         assert svc.get_operation_logs_count() == 1
 
 

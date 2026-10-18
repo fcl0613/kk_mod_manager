@@ -53,6 +53,30 @@ class PendingAction(Enum):
     INSTALL_AND_COLLECT = "install_and_collect"
 
 
+class LogDock(QDockWidget):
+    """操作日志停靠面板。
+
+    Qt6 浮动后的 QDockWidget 用系统原生标题栏（Qt 自绘标题条只在坞内
+    出现），双击原生标题栏走系统行为（最大化/无动作），Qt 收不到
+    mouseDoubleClickEvent，回坞无从触发——这里接管非客户区双击：
+    浮动时双击原生标题栏 = 回坞。
+    """
+
+    def event(self, e):
+        if (
+            e.type() == QEvent.Type.NonClientAreaMouseButtonDblClick
+            and self.isFloating()
+        ):
+            # 延迟一拍：避免在系统非客户区消息处理途中销毁原生浮动窗口
+            QTimer.singleShot(0, self._dock_back)
+            return True
+        return super().event(e)
+
+    def _dock_back(self):
+        if self.isFloating():
+            self.setFloating(False)
+
+
 class MainWindow(QMainWindow):
     """主窗口"""
 
@@ -380,7 +404,7 @@ class MainWindow(QMainWindow):
         """创建底部停靠面板：操作日志（默认隐藏，工具栏 📜 / Ctrl+L 开关）"""
         self.log_page = OperationLogPage(self._mod_service)
 
-        self.log_dock = QDockWidget("📜 操作日志", self)
+        self.log_dock = LogDock("📜 操作日志", self)
         self.log_dock.setWidget(self.log_page)
         self.log_dock.setAllowedAreas(
             Qt.DockWidgetArea.BottomDockWidgetArea | Qt.DockWidgetArea.TopDockWidgetArea

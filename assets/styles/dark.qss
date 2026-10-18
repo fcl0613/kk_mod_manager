@@ -40,16 +40,6 @@ QToolBar QToolButton::menu-indicator {
     image: none;
 }
 
-/* 底部停靠面板（操作日志，F10-3） */
-QDockWidget {
-    color: #cdd6f4;
-}
-QDockWidget::title {
-    background-color: #181825;
-    border: 1px solid #313244;
-    padding: 6px 10px;
-}
-
 /* 右键/下拉菜单 */
 QMenu {
     background-color: #313244;

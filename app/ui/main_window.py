@@ -15,11 +15,11 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QPushButton, QLineEdit, QLabel,
     QTreeWidget, QTreeWidgetItem, QSplitter,
-    QTabWidget, QTabBar, QStackedWidget, QDockWidget,
+    QTabWidget, QTabBar, QStackedWidget,
     QStatusBar, QFileDialog, QMessageBox, QProgressDialog,
     QToolButton, QMenu,
 )
-from PyQt6.QtCore import Qt, QSize, QTimer, QThread, QRect, QEvent
+from PyQt6.QtCore import Qt, QSize, QTimer, QThread
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QShortcut, QKeySequence
 from loguru import logger
 
@@ -42,7 +42,7 @@ from app.ui.batch_install_dialog import BatchInstallDialog
 from app.ui.sync_dialog import SyncDialog
 from app.ui.version_scan_dialog import VersionScanDialog
 from app.ui.duplicate_scan_dialog import DuplicateScanDialog
-from app.ui.operation_log_page import OperationLogPage
+from app.ui.log_dialog import LogDialog
 from app.ui.card_parse_worker import CardParseWorker
 from app.utils.version_utils import display_version
 
@@ -51,30 +51,6 @@ class PendingAction(Enum):
     """重试操作类型"""
     INSTALL = "install"
     INSTALL_AND_COLLECT = "install_and_collect"
-
-
-class LogDock(QDockWidget):
-    """操作日志停靠面板。
-
-    Qt6 浮动后的 QDockWidget 用系统原生标题栏（Qt 自绘标题条只在坞内
-    出现），双击原生标题栏走系统行为（最大化/无动作），Qt 收不到
-    mouseDoubleClickEvent，回坞无从触发——这里接管非客户区双击：
-    浮动时双击原生标题栏 = 回坞。
-    """
-
-    def event(self, e):
-        if (
-            e.type() == QEvent.Type.NonClientAreaMouseButtonDblClick
-            and self.isFloating()
-        ):
-            # 延迟一拍：避免在系统非客户区消息处理途中销毁原生浮动窗口
-            QTimer.singleShot(0, self._dock_back)
-            return True
-        return super().event(e)
-
-    def _dock_back(self):
-        if self.isFloating():
-            self.setFloating(False)
 
 
 class MainWindow(QMainWindow):
@@ -166,8 +142,8 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(self.page_stack, 1)
 
-        # ── 底部停靠面板：操作日志（F10-3）──
-        self._create_log_dock()
+        # ── 操作日志对话框（F10-3）──
+        self._create_log_dialog()
 
         # ── 状态栏 ──
         self.status_bar = QStatusBar()
@@ -274,12 +250,12 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        # 操作日志（开关式，控制底部停靠面板，F10-3）
+        # 操作日志（开关式，控制日志对话框，F10-3）
         self.log_btn = QToolButton()
         self.log_btn.setText("📜")
         self.log_btn.setToolTip("操作日志（Ctrl+L）")
         self.log_btn.setCheckable(True)
-        self.log_btn.clicked.connect(self._toggle_log_dock)
+        self.log_btn.clicked.connect(self._toggle_log_dialog)
         toolbar.addWidget(self.log_btn)
 
         # 设置（图标式）
@@ -306,7 +282,7 @@ class MainWindow(QMainWindow):
 
         log_sc = QShortcut(QKeySequence("Ctrl+L"), self)
         log_sc.activated.connect(
-            lambda: self._toggle_log_dock(not self.log_dock.isVisible()))
+            lambda: self._toggle_log_dialog(not self.log_dialog.isVisible()))
 
     def _create_left_panel(self) -> QWidget:
         """创建左侧面板（Tab 切换游戏/仓库的 Mod 列表）"""
@@ -397,73 +373,26 @@ class MainWindow(QMainWindow):
                 self.card_page.set_card_result(self._card_result)
 
     # ═══════════════════════════════════════════════════════
-    # 操作日志停靠面板（F10-3）
+    # 操作日志对话框（F10-3）
     # ═══════════════════════════════════════════════════════
 
-    def _create_log_dock(self):
-        """创建底部停靠面板：操作日志（默认隐藏，工具栏 📜 / Ctrl+L 开关）"""
-        self.log_page = OperationLogPage(self._mod_service)
+    def _create_log_dialog(self):
+        """创建操作日志非模态对话框（默认隐藏，工具栏 📜 / Ctrl+L 开关；
+        弹出位置/大小不持久化，默认居中于主窗口）"""
+        self.log_dialog = LogDialog(self._mod_service, self)
+        self.log_dialog.visibility_changed.connect(self._on_log_dialog_visibility)
 
-        self.log_dock = LogDock("📜 操作日志", self)
-        self.log_dock.setWidget(self.log_page)
-        self.log_dock.setAllowedAreas(
-            Qt.DockWidgetArea.BottomDockWidgetArea | Qt.DockWidgetArea.TopDockWidgetArea
-        )
-        self.log_dock.setFeatures(
-            QDockWidget.DockWidgetFeature.DockWidgetClosable
-            | QDockWidget.DockWidgetFeature.DockWidgetMovable
-            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
-        )
-        self.log_dock.visibilityChanged.connect(self._on_log_dock_visibility)
-        self.log_dock.topLevelChanged.connect(self._on_log_dock_top_level)
-        self.log_dock.installEventFilter(self)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.log_dock)
-        self.log_dock.hide()
-        # 浮动前的坞内高度 / 用户浮动几何（回坞、再浮动时复原，见下）
-        self._log_dock_height: int | None = None
-        self._log_float_geometry: QRect | None = None
-
-    def _on_log_dock_top_level(self, floating: bool):
-        """浮动/回坞切换：双向复原几何。
-
-        Qt 只有一份几何记忆且回坞会把浮动窗口尺寸带进坞内：
-        - 回坞：底部面板高度被浮动尺寸顶掉 → 浮动瞬间记住坞内高度，
-          回坞后延迟一拍（等主窗口布局完成）用 resizeDocks 复原；
-          但复原会反过来覆盖 Qt 记住的浮动几何 →
-        - 再浮动：用事件过滤器在浮动期间记下的用户几何主动还原。
-        """
-        if floating:
-            self._log_dock_height = self.log_dock.height()
-            if self._log_float_geometry is not None:
-                geo = QRect(self._log_float_geometry)
-                QTimer.singleShot(0, lambda: self.log_dock.setGeometry(geo))
-        elif self._log_dock_height is not None:
-            h = self._log_dock_height
-            QTimer.singleShot(
-                0,
-                lambda: self.resizeDocks(
-                    [self.log_dock], [h], Qt.Orientation.Vertical),
-            )
-
-    def eventFilter(self, obj, event):
-        """记录日志面板浮动期间的用户几何（Move/Resize），供再浮动时还原"""
-        if (
-            obj is self.log_dock
-            and self.log_dock.isFloating()
-            and event.type() in (QEvent.Type.Move, QEvent.Type.Resize)
-        ):
-            self._log_float_geometry = QRect(self.log_dock.geometry())
-        return super().eventFilter(obj, event)
-
-    def _on_log_dock_visibility(self, visible: bool):
-        """停靠面板可见性变化：同步工具栏按钮勾选态；打开时拉最新日志"""
+    def _on_log_dialog_visibility(self, visible: bool):
+        """对话框可见性变化（✕/Esc/主窗口最小化还原均覆盖）：同步按钮勾选态"""
         self.log_btn.setChecked(visible)
-        if visible:
-            self.log_page.refresh()
 
-    def _toggle_log_dock(self, checked: bool):
-        """工具栏 📜 按钮 / Ctrl+L：开关停靠面板"""
-        self.log_dock.setVisible(checked)
+    def _toggle_log_dialog(self, checked: bool):
+        """工具栏 📜 按钮 / Ctrl+L：开关日志对话框"""
+        if checked:
+            self.log_dialog.show()
+            self.log_dialog.raise_()  # 非模态从属窗口，确保不被主窗口盖住
+        else:
+            self.log_dialog.hide()
 
     def switch_to_card_page(self):
         """切换到卡片解析页面"""

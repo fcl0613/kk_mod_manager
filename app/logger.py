@@ -19,6 +19,18 @@ from pathlib import Path
 from loguru import logger
 
 
+def get_log_dir() -> Path:
+    """返回运行日志目录（打包后 exe 同级，开发模式项目根目录下的 logs/）。
+
+    setup_logging 与 UI「打开日志文件夹」入口共用此判定，避免两处逻辑漂移。
+    """
+    if getattr(_sys, 'frozen', False):
+        # PyInstaller 打包后：exe 同级目录
+        return Path(_sys.executable).parent / "logs"
+    # 开发模式：logger.py 所在目录的上两级（项目根目录）
+    return Path(__file__).parent.parent / "logs"
+
+
 def setup_logging(log_dir: Path | None = None):
     """配置 loguru 日志。
 
@@ -27,12 +39,7 @@ def setup_logging(log_dir: Path | None = None):
     """
     # 确定日志目录
     if log_dir is None:
-        if getattr(_sys, 'frozen', False):
-            # PyInstaller 打包后：exe 同级目录
-            log_dir = Path(_sys.executable).parent / "logs"
-        else:
-            # 开发模式：logger.py 所在目录的上两级（项目根目录）
-            log_dir = Path(__file__).parent.parent / "logs"
+        log_dir = get_log_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # 移除默认 handler

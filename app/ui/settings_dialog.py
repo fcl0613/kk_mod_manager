@@ -12,12 +12,15 @@
 
 from pathlib import Path
 
+from PyQt6.QtCore import QUrl
+from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton, QCheckBox, QComboBox,
-    QGroupBox, QFormLayout, QFileDialog, QPlainTextEdit, QLabel, QWidget
+    QGroupBox, QFormLayout, QFileDialog, QPlainTextEdit, QLabel, QWidget, QMessageBox
 )
 
 from app.config import describe_category, get_config, save_config
+from app.logger import get_log_dir
 
 
 class SettingsDialog(QDialog):
@@ -146,6 +149,13 @@ class SettingsDialog(QDialog):
 
         # ── 按钮 ──
         btn_layout = QHBoxLayout()
+
+        # 运行日志：低频诊断入口，放左下角，不与设置项混排
+        log_btn = QPushButton("📂 打开日志文件夹")
+        log_btn.setToolTip("在资源管理器中打开运行日志目录（logs/，按天滚动保留 30 天）")
+        log_btn.clicked.connect(self._open_log_dir)
+        btn_layout.addWidget(log_btn)
+
         btn_layout.addStretch()
 
         cancel_btn = QPushButton("取消")
@@ -257,6 +267,13 @@ class SettingsDialog(QDialog):
         )
         if path:
             self.sidelog_path_edit.setText(path)
+
+    def _open_log_dir(self):
+        """在资源管理器中打开运行日志目录（与 setup_logging 同一目录判定）"""
+        log_dir = get_log_dir()
+        log_dir.mkdir(parents=True, exist_ok=True)  # 启动时已创建，此处兜底
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_dir))):
+            QMessageBox.warning(self, "打开失败", f"无法打开日志文件夹：\n{log_dir}")
 
     def _save(self):
         """保存配置"""

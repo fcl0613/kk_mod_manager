@@ -4,6 +4,8 @@ sync_from_disk / refresh_from_disk 已由 tests/sync_service_test.py 手动脚�
 此处不重复；仅测 SyncReport 数据类。
 """
 
+import os
+import shutil
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -841,6 +843,218 @@ class TestBatchUpgradeFromRepo:
         assert result.total == 1 and result.failed_count == 1
         assert result.items[0].status is BatchItemStatus.FAILED
         assert "未配置" in result.items[0].message
+
+
+# ═══════════════════════════════════════════════════════════
+# 重复项检查 scan_duplicates（F22-1/2/3/4）
+# ═══════════════════════════════════════════════════════════
+
+class TestScanDuplicates:
+    def test_same_guid_same_location_grouped(self, svc, dirs):
+        make_zipmod(dirs.game / "A", "ModA_old", "g.a", version="1.0.0")
+        make_zipmod(dirs.game / "A", "ModA_new", "g.a", version="2.0.0")
+        make_zipmod(dirs.game / "B", "ModB", "g.b", version="1.0.0")
+
+        report = svc.scan_duplicates()
+
+        assert len(report.groups) == 1
+        group = report.groups[0]
+        assert group.guid == "g.a" and group.location == ModLocation.GAME
+        assert group.name == "ModA_new"                 # 展示名取保留建议项
+        assert len(group.files) == 2
+        assert report.scanned_game == 3 and report.scanned_repo == 0
+        # 保留建议：版本高者保留，其余为建议删除项（F22-4）
+        keeper, old = group.files
+        assert keeper.suggested_keep and keeper.version == "2.0.0"
+        assert not old.suggested_keep and old.version == "1.0.0"
+        assert group.suggested_delete_files == [old]
+        assert report.suggested_delete_count == 1
+
+    def test_cross_location_same_guid_not_duplicate(self, svc, dirs):
+        """F22-2：跨位置各一份同 GUID 不算重复（BR-D04 正常收藏形态）"""
+        make_zipmod(dirs.game / "A", "ModA", "g.a", version="1.0.0")
+        make_zipmod(dirs.repo / "A", "ModA", "g.a", version="1.0.0")
+
+        report = svc.scan_duplicates()
+
+        assert report.groups == []
+        assert report.scanned_game == 1 and report.scanned_repo == 1
+
+    def test_disabled_file_counted_and_annotated(self, svc, dirs):
+        make_zipmod(dirs.game / "A", "ModA", "g.a", version="2.0.0")
+        make_zipmod(dirs.game / "A", "ModA_old", "g.a", version="1.0.0", disabled=True)
+
+        report = svc.scan_duplicates()
+
+        group = report.groups[0]
+        disabled = [f for f in group.files if f.is_disabled]
+        assert len(disabled) == 1 and disabled[0].version == "1.0.0"
+        assert group.files[0].suggested_keep and not group.files[0].is_disabled
+
+    def test_md5_identical_twin_flagged_within_group(self, svc, dirs):
+        make_zipmod(dirs.game / "A", "ModA", "g.a", version="2.0.0")
+        p_old = make_zipmod(dirs.game / "B", "ModA_old", "g.a", version="1.0.0")
+        twin = dirs.game / "C" / "ModA_old.zipmod"
+        twin.parent.mkdir(parents=True)
+        shutil.copy2(p_old, twin)  # 字节级相同副本（手工拷贝场景）
+
+        report = svc.scan_duplicates()
+
+        group = report.groups[0]
+        twins = {f.path for f in group.files if f.has_identical_twin}
+        assert twins == {p_old, twin}
+        assert all(f.md5 for f in group.files)
+        assert not group.files[0].has_identical_twin  # 保留项没有相同副本
+
+    def test_keeper_prefers_enabled_on_same_version(self, svc, dirs):
+        enabled = make_zipmod(dirs.game / "A", "ModA", "g.a", version="1.0.0")
+        disabled = make_zipmod(
+            dirs.game / "A", "ModA_old", "g.a", version="1.0.0", disabled=True
+        )
+        os.utime(disabled, (2_000_000_000, 2_000_000_000))  # 禁用副本修改时间反而更新
+
+        report = svc.scan_duplicates()
+
+        assert report.groups[0].files[0].path == enabled
+
+    def test_keeper_falls_back_to_mtime_on_unparseable_versions(self, svc, dirs):
+        p_old = make_zipmod(dirs.game / "A", "ModA", "g.a", version="ver.one")
+        p_new = make_zipmod(dirs.game / "A", "ModA2", "g.a", version="ver.two")
+        os.utime(p_old, (1_000_000_000, 1_000_000_000))
+        os.utime(p_new, (1_500_000_000, 1_500_000_000))
+
+        report = svc.scan_duplicates()
+
+        assert report.groups[0].files[0].path == p_new
+
+    def test_parse_failure_reported_not_grouped(self, svc, dirs):
+        make_bad_file(dirs.game / "A", "broken.zipmod")
+        make_zipmod(dirs.game / "A", "ModA", "g.a")
+
+        report = svc.scan_duplicates()
+
+        assert report.groups == []
+        assert len(report.parse_failures) == 1
+        assert report.parse_failures[0].path.name == "broken.zipmod"
+        assert report.parse_failures[0].location == ModLocation.GAME
+
+    def test_skips_unconfigured_location(self, svc, dirs):
+        make_zipmod(dirs.game / "A", "ModA", "g.a")
+        set_config(repo_path="")
+
+        report = svc.scan_duplicates()
+
+        assert report.groups == []
+        assert "未配置" in report.skipped_repo
+        assert report.skipped_game == ""
+
+    def test_progress_callback_shape(self, svc, dirs):
+        """解析阶段逐文件 + MD5 阶段逐文件 + 末次「完成」哨兵"""
+        _seed_leftover(svc, dirs)
+        progress = MagicMock()
+
+        svc.scan_duplicates(progress_callback=progress)
+
+        # 游戏侧 2 个文件：解析 2 次 + 组内 MD5 2 次 + 完成哨兵 1 次
+        assert progress.call_count == 5
+        assert progress.call_args == ((2, 2, "完成"),)
+        assert progress.call_args_list[0].args[2] == "ModA.zipmod"
+
+
+# ═══════════════════════════════════════════════════════════
+# 重复项清理 cleanup_duplicates（F22-5）
+# ═══════════════════════════════════════════════════════════
+
+def _seed_leftover(svc, dirs, guid="g.a"):
+    """游戏装 v2（DB 跟踪该文件），磁盘作者目录残留 v1 旧文件。
+
+    模拟 BR-F05/F06 版本化重命名积累 + 手工拷贝副本的典型重复来源；
+    返回残留文件路径。
+    """
+    f2 = make_zipmod(dirs.root / "src2", "ModA", guid, version="2.0.0", author="Xavier")
+    assert svc.install_to_game(f2).success
+    f1 = make_zipmod(dirs.root / "src1", "ModAold", guid, version="1.0.0", author="Xavier")
+    leftover = dirs.game / "Xavier" / "ModAold.zipmod"
+    shutil.copy2(f1, leftover)
+    return leftover
+
+
+class TestCleanupDuplicates:
+    def test_deletes_suggested_leftover_keeps_tracked_file(self, svc, dirs):
+        leftover = _seed_leftover(svc, dirs)
+
+        report = svc.scan_duplicates()
+        group = report.groups[0]
+        assert [f.path for f in group.suggested_delete_files] == [leftover]
+
+        result = svc.cleanup_duplicates(group.suggested_delete_files)
+
+        assert result.success_count == 1 and result.failed_count == 0
+        assert files_under(dirs.game) == {"Xavier/ModA.zipmod"}    # 残留已删
+        assert svc.get_game_mod_by_guid("g.a").version == "2.0.0"  # DB 跟踪行原样
+        assert len(result.sync_reports) == 1                        # 删除后对账
+        assert result.sync_reports[0].change_count == 0             # 对账无变更
+
+    def test_repoints_db_row_when_tracked_file_deleted(self, svc, dirs):
+        """被删的恰是 DB 跟踪文件时，对账把行重新指向磁盘幸存文件"""
+        _seed_leftover(svc, dirs)
+        report = svc.scan_duplicates()
+        group = report.groups[0]
+        tracked = group.files[0]   # 建议保留项 = DB 跟踪的 v2
+        survivor = group.files[1]  # 残留的 v1
+
+        result = svc.cleanup_duplicates([tracked])
+
+        assert result.success_count == 1
+        assert files_under(dirs.game) == {"Xavier/ModAold.zipmod"}
+        row = svc.get_game_mod_by_guid("g.a")
+        assert row.version == "1.0.0" and row.file_name == "ModAold.zipmod"
+        assert row.game_relative_path == "Xavier/ModAold.zipmod"
+        assert db_op_count(svc, "sync") == 1  # 对账更新了行 → 有 sync 日志
+
+    def test_missing_file_skipped_without_sync_or_log(self, svc, dirs):
+        _seed_leftover(svc, dirs)
+        report = svc.scan_duplicates()
+        entries = report.groups[0].suggested_delete_files
+        entries[0].path.unlink()  # 扫描后文件被手动删掉
+
+        result = svc.cleanup_duplicates(entries)
+
+        assert result.skipped_count == 1 and result.success_count == 0
+        assert result.items[0].status is BatchItemStatus.SKIPPED
+        assert result.sync_reports == []  # 无实际删除 → 不对账
+        assert db_op_count(svc, "dedup") == 0
+
+    def test_writes_dedup_log_with_file_names(self, svc, dirs):
+        _seed_leftover(svc, dirs)
+        report = svc.scan_duplicates()
+
+        svc.cleanup_duplicates(report.groups[0].suggested_delete_files)
+
+        assert db_op_count(svc, "dedup") == 1
+        log = svc.session.query(OperationLog).filter_by(operation="dedup").one()
+        assert log.mod_name == "(重复项清理)"
+        assert log.location == "game"
+        assert "1 个重复文件" in log.detail and "ModAold.zipmod" in log.detail
+        # 本场景 DB 跟踪行未变 → 对账无变更、无 sync 日志
+        assert db_op_count(svc, "sync") == 0
+
+    def test_empty_author_dir_cleaned_after_delete(self, svc, dirs):
+        """残留独占的子目录在删除后顺手移除（clean_empty_dirs 默认开）"""
+        _seed_leftover(svc, dirs)
+        leftover_dir = dirs.game / "OldAuthor"
+        leftover_dir.mkdir()
+        shutil.move(
+            str(dirs.game / "Xavier" / "ModAold.zipmod"),
+            str(leftover_dir / "ModAold.zipmod"),
+        )
+
+        report = svc.scan_duplicates()
+        result = svc.cleanup_duplicates(report.groups[0].suggested_delete_files)
+
+        assert result.success_count == 1
+        assert files_under(dirs.game) == {"Xavier/ModA.zipmod"}
+        assert not leftover_dir.exists()
 
 
 class TestAddGameModToRepo:

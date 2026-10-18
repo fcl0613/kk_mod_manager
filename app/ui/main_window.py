@@ -41,6 +41,7 @@ from app.ui.card_parse_page import CardParsePage
 from app.ui.batch_install_dialog import BatchInstallDialog
 from app.ui.sync_dialog import SyncDialog
 from app.ui.version_scan_dialog import VersionScanDialog
+from app.ui.duplicate_scan_dialog import DuplicateScanDialog
 from app.ui.card_parse_worker import CardParseWorker
 from app.utils.version_utils import display_version
 
@@ -226,6 +227,7 @@ class MainWindow(QMainWindow):
         data_btn = make_menu_btn("🔄 数据 ▾", "数据库与磁盘的同步 / 重建")
         data_btn.menu().addAction("⟳ 同步磁盘（保留备注）", self._sync_mods)
         data_btn.menu().addAction("🔍 仓库版本巡检", self._version_scan)
+        data_btn.menu().addAction("🧹 重复项检查", self._duplicate_scan)
         data_btn.menu().addSeparator()
         data_btn.menu().addAction("⚠ 初始化MOD（清空重建）", self._init_mod)
         toolbar.addWidget(data_btn)
@@ -1259,6 +1261,27 @@ class MainWindow(QMainWindow):
 
     def _on_version_upgrade_finished(self):
         """F24 worker 用独立 session 提交，需过期后重查（同 _on_sync_finished）"""
+        self._mod_service.session.expire_all()
+        self._refresh_game_list()
+        self._refresh_repo_list()
+
+    def _duplicate_scan(self):
+        """重复项检查 / 清理（F22，后台线程）"""
+        config = get_config()
+        if not config.game_mod_path and not config.repo_path:
+            # 两侧独立扫描，至少需要一侧路径（同步磁盘的口径）
+            QMessageBox.warning(
+                self,
+                "提示",
+                "重复项检查需要配置游戏 Mod 路径或本地仓库路径，请先在设置中配置",
+            )
+            return
+        dialog = DuplicateScanDialog(self)
+        dialog.cleanup_finished.connect(self._on_duplicate_cleanup_finished)
+        dialog.exec()
+
+    def _on_duplicate_cleanup_finished(self):
+        """F22 worker 用独立 session 提交，需过期后重查（同 _on_sync_finished）"""
         self._mod_service.session.expire_all()
         self._refresh_game_list()
         self._refresh_repo_list()

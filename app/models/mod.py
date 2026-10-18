@@ -134,7 +134,7 @@ class OperationLog(Base):
 
     operation: Mapped[str] = mapped_column(
         String(50), nullable=False,
-        comment="操作类型：install / uninstall / repo_add / repo_remove / enable / disable / upgrade"
+        comment="操作类型：install / uninstall / repo_add / repo_remove / enable / disable / upgrade / sync / dedup"
     )
     mod_name: Mapped[str] = mapped_column(
         String(200), nullable=False, comment="Mod 名称"

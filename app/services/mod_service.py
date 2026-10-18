@@ -13,6 +13,7 @@
   - 双重检测（游戏+仓库）防止重复
 """
 
+import hashlib
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -203,6 +204,124 @@ class BatchUpgradeResult:
     skipped_count: int = 0
     failed_count: int = 0
     items: list[UpgradeItemResult] = field(default_factory=list)
+
+
+# ═══════════════════════════════════════════════════════════
+# 重复项检查 / 清理相关数据类（F22）
+# ═══════════════════════════════════════════════════════════
+
+
+@dataclass
+class DuplicateFileEntry:
+    """F22 重复组内的单个磁盘文件（判重以磁盘扫描 + manifest 解析为准）"""
+    path: Path                        # 磁盘绝对路径
+    location: ModLocation             # GAME / REPO（组内同位置，F22-2）
+    guid: str
+    name: str                         # manifest 名称
+    version: str                      # 原始版本串（展示层走 display_version）
+    author: str
+    size: int                         # 字节数
+    mtime: float                      # 修改时间戳
+    is_disabled: bool                 # .zipmod_disabled（计入并标注，F22-2）
+    relative_path: str                # 相对位置根目录（展示 / 提示用）
+    md5: str = ""                     # 组内补算（F22-3），读取失败为 ""
+    has_identical_twin: bool = False  # 组内存在 MD5 相同的其他文件（字节级副本）
+    suggested_keep: bool = False      # 「保留最新版」建议（F22-4）
+
+
+@dataclass
+class DuplicateGroup:
+    """F22 同位置内同 GUID 的重复文件组"""
+    guid: str
+    name: str                   # 展示名（取保留建议项的 manifest 名）
+    author: str
+    location: ModLocation
+    files: list[DuplicateFileEntry]  # 展示序：建议保留项居首，其余按修改时间降序
+
+    @property
+    def suggested_delete_files(self) -> list[DuplicateFileEntry]:
+        """建议删除的文件（除保留项外全部，F22-4 默认预勾选项）"""
+        return [f for f in self.files if not f.suggested_keep]
+
+
+@dataclass
+class DuplicateParseFailure:
+    """F22 扫描中解析失败的文件（不参与判重，仅提示）"""
+    path: Path
+    location: ModLocation
+    reason: str
+
+
+@dataclass
+class DuplicateScanReport:
+    """重复项检查报告（F22-1）"""
+    groups: list[DuplicateGroup] = field(default_factory=list)
+    scanned_game: int = 0
+    scanned_repo: int = 0
+    skipped_game: str = ""       # 非空 = 游戏侧跳过原因（未配置 / 目录不存在）
+    skipped_repo: str = ""
+    parse_failures: list[DuplicateParseFailure] = field(default_factory=list)
+
+    @property
+    def duplicate_file_count(self) -> int:
+        """重复组内的文件总数"""
+        return sum(len(g.files) for g in self.groups)
+
+    @property
+    def suggested_delete_count(self) -> int:
+        """建议删除的文件数"""
+        return sum(len(g.suggested_delete_files) for g in self.groups)
+
+    @property
+    def suggested_delete_size(self) -> int:
+        """建议删除项合计字节数（可释放空间）"""
+        return sum(f.size for g in self.groups for f in g.suggested_delete_files)
+
+    def summary(self) -> str:
+        """一行中文摘要（供 UI / 操作日志使用，对齐 VersionScanReport.summary）"""
+        lines = []
+        if self.skipped_game:
+            lines.append(f"[游戏] 跳过：{self.skipped_game}")
+        if self.skipped_repo:
+            lines.append(f"[仓库] 跳过：{self.skipped_repo}")
+        lines.append(
+            f"重复项检查：扫描游戏 {self.scanned_game} / 仓库 {self.scanned_repo} 个文件 | "
+            f"重复 GUID {len(self.groups)} 组（{self.duplicate_file_count} 个文件）| "
+            f"建议删除 {self.suggested_delete_count} 项"
+        )
+        if self.parse_failures:
+            lines.append(f"另有 {len(self.parse_failures)} 个文件解析失败（不参与判重）")
+        return "\n".join(lines)
+
+
+@dataclass
+class CleanupItemResult:
+    """F22 清理单项结果"""
+    entry: DuplicateFileEntry
+    status: BatchItemStatus = BatchItemStatus.PENDING   # 复用批量安装状态枚举
+    message: str = ""
+
+
+@dataclass
+class DuplicateCleanupResult:
+    """F22 批量清理总结果"""
+    total: int = 0
+    success_count: int = 0
+    skipped_count: int = 0
+    failed_count: int = 0
+    items: list[CleanupItemResult] = field(default_factory=list)
+    sync_reports: list[SyncReport] = field(default_factory=list)  # 删除后对账报告
+    sync_errors: list[str] = field(default_factory=list)          # 对账失败的异常信息
+
+    def summary(self) -> str:
+        """一行中文摘要"""
+        text = (
+            f"重复项清理：删除 {self.success_count} · 跳过 {self.skipped_count} · "
+            f"失败 {self.failed_count}"
+        )
+        if self.sync_reports:
+            text += " | " + "；".join(r.summary() for r in self.sync_reports)
+        return text
 
 
 def _normalize_author(author: str | None) -> str:
@@ -1106,6 +1225,292 @@ class ModService:
             result.total, result.success_count, result.skipped_count, result.failed_count,
         )
         return result
+
+    # ═══════════════════════════════════════════════════════════
+    # 重复项检查 / 清理（F22）
+    # ═══════════════════════════════════════════════════════════
+
+    def scan_duplicates(
+        self,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> DuplicateScanReport:
+        """扫描磁盘找出同位置内同 GUID 的重复文件（F22-1/2/3）。
+
+        实现口径（候选清单 B5 定案）：以磁盘扫描 + manifest 解析为准，
+        不查库——DB 唯一索引 (location, guid) 使同位置多文件在库里只留
+        一行，纯查库会漏报。GAME / REPO 内部**分别**判重，跨位置各一份
+        同 GUID 不算重复（BR-D04 正常收藏形态）。
+
+        MD5 只在重复组内补算（F22-3），用于标注「字节级完全相同」的副本；
+        不做全量 MD5 扫描。
+
+        Args:
+            progress_callback: 进度回调 (当前序号, 总数, 文件名)。
+                解析阶段跨两侧全局计数，MD5 阶段按组内文件数单独计数。
+
+        Returns:
+            DuplicateScanReport（含建议保留项勾选，F22-4）
+        """
+        report = DuplicateScanReport()
+        config = get_config()
+
+        # ── 阶段 1：收集两侧文件清单（rglob 先拿全量，解析进度才能全局计数）──
+        targets: list[tuple[ModLocation, Path]] = []
+        for location, path_str, label in (
+            (ModLocation.GAME, config.game_mod_path, "游戏 Mod 路径"),
+            (ModLocation.REPO, config.repo_path, "仓库路径"),
+        ):
+            reason = ""
+            if not path_str:
+                reason = f"未配置{label}"
+            elif not Path(path_str).exists():
+                reason = f"{label}不存在：{path_str}"
+            if reason:
+                if location == ModLocation.GAME:
+                    report.skipped_game = reason
+                else:
+                    report.skipped_repo = reason
+                continue
+            targets.append((location, Path(path_str)))
+
+        file_lists: list[tuple[ModLocation, Path, list[Path]]] = []
+        total = 0
+        for location, base_path in targets:
+            files = sorted(
+                f for f in base_path.rglob("*")
+                if f.is_file() and f.suffix.lower() in (".zipmod", ".zipmod_disabled")
+            )
+            file_lists.append((location, base_path, files))
+            if location == ModLocation.GAME:
+                report.scanned_game = len(files)
+            else:
+                report.scanned_repo = len(files)
+            total += len(files)
+
+        # ── 阶段 2：解析 manifest，按 (位置, GUID) 分组 ──────────
+        by_group: dict[tuple[ModLocation, str], list[tuple[Path, ModManifest]]] = {}
+        done = 0
+        for location, base_path, files in file_lists:
+            for file_path in files:
+                if progress_callback:
+                    progress_callback(done, total, file_path.name)
+                done += 1
+                try:
+                    manifest = self.manifest_svc.parse_from_zipmod(file_path)
+                except ManifestParseError as e:
+                    report.parse_failures.append(
+                        DuplicateParseFailure(file_path, location, str(e))
+                    )
+                    continue
+                by_group.setdefault((location, manifest.guid), []).append(
+                    (file_path, manifest)
+                )
+
+        # ── 阶段 3：构建重复组 + 组内补算 MD5（F22-3）───────────
+        md5_total = sum(len(members) for members in by_group.values() if len(members) > 1)
+        md5_done = 0
+        for (location, guid), members in by_group.items():
+            if len(members) < 2:
+                continue
+            base_path = next(base for loc, base in targets if loc == location)
+            entries: list[DuplicateFileEntry] = []
+            for file_path, manifest in members:
+                if progress_callback and md5_total:
+                    progress_callback(md5_done, md5_total, f"MD5 {file_path.name}")
+                md5_done += 1
+                try:
+                    mtime = file_path.stat().st_mtime
+                    size = file_path.stat().st_size
+                except OSError:
+                    mtime = datetime.now().timestamp()
+                    size = 0
+                entries.append(DuplicateFileEntry(
+                    path=file_path,
+                    location=location,
+                    guid=guid,
+                    name=manifest.name,
+                    version=manifest.version,
+                    author=manifest.author,
+                    size=size,
+                    mtime=mtime,
+                    is_disabled=file_path.name.lower().endswith(".zipmod_disabled"),
+                    relative_path=file_path.relative_to(base_path).as_posix(),
+                    md5=self._compute_md5(file_path),
+                ))
+
+            # 字节级相同标注：组内 MD5 出现次数 > 1 的文件互为副本（删一份零风险）
+            md5_counts: dict[str, int] = {}
+            for e in entries:
+                if e.md5:
+                    md5_counts[e.md5] = md5_counts.get(e.md5, 0) + 1
+            for e in entries:
+                e.has_identical_twin = bool(e.md5) and md5_counts[e.md5] > 1
+
+            keeper = self._choose_keeper(entries)
+            keeper.suggested_keep = True
+            rest = sorted(
+                (e for e in entries if e is not keeper),
+                key=lambda e: e.mtime,
+                reverse=True,
+            )
+            report.groups.append(DuplicateGroup(
+                guid=guid,
+                name=keeper.name,
+                author=keeper.author,
+                location=location,
+                files=[keeper] + rest,
+            ))
+
+        report.groups.sort(key=lambda g: (
+            g.location != ModLocation.GAME,   # 游戏组在前
+            (g.author or "").lower(),
+            g.name.lower(),
+        ))
+        if progress_callback and md5_total:
+            progress_callback(md5_total, md5_total, "完成")
+
+        logger.info("重复项检查完成: {}", report.summary().replace("\n", " | "))
+        return report
+
+    def cleanup_duplicates(
+        self,
+        entries: list[DuplicateFileEntry],
+        progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> DuplicateCleanupResult:
+        """删除选中的重复文件并对账数据库（F22-5：用户确认后才调用，首期硬删除）。
+
+        删除后对每个发生实际删除的位置跑一次增量磁盘同步（sync_from_disk）
+        把 DB 行重新对准磁盘幸存文件——判重以磁盘为准，被删的可能正是
+        DB 跟踪的文件。单项失败不中断批量；对账失败不影响已完成的删除，
+        错误记入 sync_errors 提示用户手动「同步磁盘」。
+
+        Args:
+            entries: 待删除的文件（通常来自 DuplicateScanReport 的勾选项）
+            progress_callback: 进度回调 (当前序号, 总数, 文件名)，
+                之后透传给 sync_from_disk（计数切到对账阶段）
+
+        Returns:
+            DuplicateCleanupResult
+        """
+        result = DuplicateCleanupResult(total=len(entries))
+        config = get_config()
+        deleted_by_location: dict[ModLocation, list[CleanupItemResult]] = {}
+
+        for idx, entry in enumerate(entries):
+            if progress_callback:
+                progress_callback(idx, len(entries), entry.path.name)
+            item = CleanupItemResult(entry=entry)
+            if not entry.path.exists():
+                item.status = BatchItemStatus.SKIPPED
+                item.message = "文件已不存在（可能已被手动删除）"
+                result.skipped_count += 1
+            else:
+                try:
+                    entry.path.unlink()
+                except OSError as e:
+                    item.status = BatchItemStatus.FAILED
+                    item.message = f"删除失败：{e}"
+                    result.failed_count += 1
+                    logger.error("重复项清理 - 删除失败: {} - {}", entry.path, e)
+                else:
+                    item.status = BatchItemStatus.SUCCESS
+                    item.message = f"已删除 {entry.relative_path}"
+                    result.success_count += 1
+                    deleted_by_location.setdefault(entry.location, []).append(item)
+                    logger.info("重复项清理 - 删除: {} (GUID={})", entry.path, entry.guid)
+            result.items.append(item)
+
+        if progress_callback:
+            progress_callback(len(entries), len(entries), "完成")
+
+        # 空目录清理（镜像 uninstall：GAME 端保护分类目录，BR-CAT06）
+        if config.clean_empty_dirs and deleted_by_location:
+            for location in deleted_by_location:
+                base_str = (
+                    config.game_mod_path if location == ModLocation.GAME
+                    else config.repo_path
+                )
+                if not base_str or not Path(base_str).exists():
+                    continue
+                if location == ModLocation.GAME:
+                    clean_empty_dirs(
+                        Path(base_str), exclude_names=set(config.category.category_names)
+                    )
+                else:
+                    clean_empty_dirs(Path(base_str))
+
+        # 聚合操作日志 + 增量对账（每位置一条，仅实际发生删除的位置）
+        for location in (ModLocation.GAME, ModLocation.REPO):
+            deleted = deleted_by_location.get(location)
+            if not deleted:
+                continue
+            names = "、".join(i.entry.path.name for i in deleted)[:300]
+            self._log_operation(
+                operation="dedup",
+                mod_name="(重复项清理)",
+                mod_guid="",
+                location=location.value,
+                detail=f"硬删除 {len(deleted)} 个重复文件：{names}",
+            )
+            self.session.commit()
+
+            try:
+                result.sync_reports.append(
+                    self.sync_from_disk(location, progress_callback=progress_callback)
+                )
+            except Exception as e:  # noqa: BLE001 - 对账失败不影响已完成的删除
+                self.session.rollback()
+                result.sync_errors.append(f"[{location.value}] {e}")
+                logger.error("重复项清理 - 对账失败({}): {}", location.value, e)
+
+        logger.info(
+            "重复项清理完成: 删除={} 跳过={} 失败={} 对账失败={}",
+            result.success_count, result.skipped_count, result.failed_count,
+            len(result.sync_errors),
+        )
+        return result
+
+    @staticmethod
+    def _compute_md5(path: Path) -> str:
+        """计算文件 MD5（分块读取，zipmod 可达数百 MB）；失败返回空串不阻断扫描"""
+        digest = hashlib.md5()
+        try:
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError as e:
+            logger.warning("重复项检查 - MD5 计算失败: {} - {}", path.name, e)
+            return ""
+        return digest.hexdigest()
+
+    @staticmethod
+    def _choose_keeper(files: list[DuplicateFileEntry]) -> DuplicateFileEntry:
+        """选出组内建议保留的文件（F22-4「保留最新版」）。
+
+        规则：可解析版本中取最高者（BR-V01）；并列或全组版本不可解析时
+        先启用态、后修改时间新者（禁用副本多为手动留的旧备份，不作首选；
+        BR-V03：版本无法比较时不断言，退到时间维度）。
+        """
+        def tie_break(e: DuplicateFileEntry) -> tuple[bool, float]:
+            return (not e.is_disabled, e.mtime)
+
+        def parse(e: DuplicateFileEntry) -> Version | None:
+            try:
+                return Version(e.version)
+            except InvalidVersion:
+                return None
+
+        best = files[0]
+        best_v = parse(best)
+        for e in files[1:]:
+            v = parse(e)
+            if v is None:
+                continue
+            if best_v is None or v > best_v or (v == best_v and tie_break(e) > tie_break(best)):
+                best, best_v = e, v
+        if best_v is None:
+            best = max(files, key=tie_break)
+        return best
 
     # ═══════════════════════════════════════════════════════════
     # 查询

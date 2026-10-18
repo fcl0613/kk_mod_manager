@@ -6,6 +6,7 @@
 """
 
 from pathlib import Path
+from collections.abc import Callable
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
@@ -31,7 +32,8 @@ from app.services.card_service import (
 class CardParsePage(QWidget):
     """卡片解析页面"""
 
-    # 信号：请求安装某个仓库中的 Mod（mod_id, 目标分类；F17-13/F19-10）
+    # 信号：请求安装某个仓库中的 Mod（mod_id, 目标分类；F17-13/F19-10）。
+    # 「升级」按钮复用同一信号（mod_id 为仓库行 ID，F15-13）
     install_mod_requested = pyqtSignal(int, str)
     # 信号：请求重新解析当前卡片
     reparse_requested = pyqtSignal()
@@ -393,7 +395,19 @@ class CardParsePage(QWidget):
                 tags = self._source_tags(item)
                 if tags:
                     info += f" {tags}"
-                self._add_item(group, item.guid, info, "🟢 已安装", "")
+                if item.has_newer_in_repo:
+                    # 版本差异角标（F15-12）：⬆ 角标 + 信息列补仓库版本 + 升级按钮（F15-13）
+                    info += f" → 仓库 {display_version(item.repo_version)}"
+                    self._add_item(
+                        group, item.guid, info, "🟢 已安装 ⬆", "升级",
+                        card_item=item,
+                        tooltip=(
+                            f"游戏 {display_version(item.mod_version)} → "
+                            f"仓库 {display_version(item.repo_version)}，可升级"
+                        ),
+                    )
+                else:
+                    self._add_item(group, item.guid, info, "🟢 已安装", "")
 
         # 🟡 仓库有分组
         if in_repo:
@@ -519,6 +533,7 @@ class CardParsePage(QWidget):
         status_text: str,
         action_text: str,
         card_item: CardModItem | None = None,
+        tooltip: str = "",
     ):
         """添加 Mod 行（列序: GUID | Mod名称 | 状态 | 操作）"""
         item = QTreeWidgetItem(parent)
@@ -526,20 +541,40 @@ class CardParsePage(QWidget):
         item.setText(1, mod_info)
         item.setText(2, status_text)
         item.setText(3, "")
+        if tooltip:
+            item.setToolTip(2, tooltip)
 
-        # 操作列：嵌入安装按钮（按依赖粗分路由目标分类，F17-13）
+        # 操作列按钮（均按依赖粗分路由目标分类，F17-13）：
+        #   安装 = 🟡 仓库行；升级 = 🟢 仓库有新版（F15-13）
         if action_text == "安装" and card_item is not None and card_item.mod_id is not None:
-            btn = QPushButton("安装")
-            btn.setFixedSize(60, 24)
-            btn.setStyleSheet(
-                "QPushButton { background-color: #a6e3a1; color: #1e1e2e; "
-                "border: none; border-radius: 3px; font-size: 11px; }"
-                "QPushButton:hover { background-color: #94e2d5; }"
+            self._add_action_button(
+                item, "安装", card_item, self._on_install_one, "#a6e3a1", "#94e2d5",
             )
-            btn.clicked.connect(
-                lambda checked, it=card_item: self._on_install_one(it)
+        elif action_text == "升级" and card_item is not None and card_item.repo_mod_id is not None:
+            self._add_action_button(
+                item, "升级", card_item, self._on_upgrade_one, "#74c7ec", "#89b4fa",
             )
-            self.tree.setItemWidget(item, 3, btn)
+        return item
+
+    def _add_action_button(
+        self,
+        tree_item: QTreeWidgetItem,
+        text: str,
+        card_item: CardModItem,
+        handler: Callable[[CardModItem], None],
+        bg_color: str,
+        hover_color: str,
+    ):
+        """在操作列嵌入动作按钮（安装/升级共用样式模板）"""
+        btn = QPushButton(text)
+        btn.setFixedSize(60, 24)
+        btn.setStyleSheet(
+            f"QPushButton {{ background-color: {bg_color}; color: #1e1e2e; "
+            "border: none; border-radius: 3px; font-size: 11px; } "
+            f"QPushButton:hover {{ background-color: {hover_color}; }}"
+        )
+        btn.clicked.connect(lambda checked, it=card_item: handler(it))
+        self.tree.setItemWidget(tree_item, 3, btn)
 
     # ═══════════════════════════════════════════════════════
     # 操作回调
@@ -549,6 +584,16 @@ class CardParsePage(QWidget):
         """单个安装按钮 — 按依赖粗分路由目标分类后发射信号（F17-13）"""
         self.install_mod_requested.emit(
             card_item.mod_id, self._target_category(card_item)
+        )
+
+    def _on_upgrade_one(self, card_item: CardModItem):
+        """单个升级按钮 — 安装仓库更新版本覆盖游戏旧版（F15-13）。
+
+        复用安装信号与路径（install_from_repo 内部按 F04-8 顺序
+        先复制成功再删旧版）；mod_id 为仓库行 ID。
+        """
+        self.install_mod_requested.emit(
+            card_item.repo_mod_id, self._target_category(card_item)
         )
 
     def _on_install_all(self):

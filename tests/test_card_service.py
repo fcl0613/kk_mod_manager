@@ -333,6 +333,61 @@ class TestCheckModAvailability:
         assert (result.total_count, result.installed_count,
                 result.in_repo_count, result.missing_count) == (0, 0, 0, 0)
 
+    # ── 版本差异角标（F15-12 / Q-04）──
+
+    @staticmethod
+    def _seed_both_locations(db_session, guid, game_ver, repo_ver):
+        """同 GUID 在 GAME / REPO 各播一行"""
+        for loc, ver in ((ModLocation.GAME, game_ver), (ModLocation.REPO, repo_ver)):
+            db_session.add(Mod(
+                guid=guid, name="Both", version=ver, author="A",
+                author_normalized="a", file_name=f"Both_{loc.value}.zipmod",
+                location=loc, status=ModStatus.ENABLED,
+            ))
+        db_session.commit()
+
+    def test_repo_newer_marks_version_badge(self, card_svc, db_session):
+        """游戏旧版 + 仓库新版 → 仍 INSTALLED 但带角标（F15-12）"""
+        self._seed_both_locations(db_session, "g.diff", "1.0.0", "2.0.0")
+
+        result = card_svc.check_mod_availability(
+            _result_with(["g.diff"]), db_session,
+        )
+        item = result.mods[0]
+        assert item.status is CardModStatus.INSTALLED  # 状态仍是 🟢，仅角标
+        assert item.location == "game"
+        assert item.has_newer_in_repo
+        assert item.repo_version == "2.0.0"
+        assert item.repo_mod_id is not None
+        assert result.installed_count == 1  # 计数口径不变（不挤占 🟡）
+
+    def test_repo_same_or_older_no_badge(self, card_svc, db_session):
+        """同版本 / 仓库更旧 → 不标角标"""
+        self._seed_both_locations(db_session, "g.same", "1.0.0", "1.0.0")
+        self._seed_both_locations(db_session, "g.older", "2.0.0", "1.0.0")
+
+        result = card_svc.check_mod_availability(
+            _result_with(["g.same", "g.older"]), db_session,
+        )
+        by_guid = {m.guid: m for m in result.mods}
+        assert by_guid["g.same"].status is CardModStatus.INSTALLED
+        assert not by_guid["g.same"].has_newer_in_repo
+        assert by_guid["g.same"].repo_mod_id is None
+        assert not by_guid["g.older"].has_newer_in_repo
+        assert by_guid["g.older"].repo_mod_id is None
+
+    def test_unparseable_version_no_badge(self, card_svc, db_session):
+        """版本无法解析（BR-V03）→ 保守不标角标，不误导"""
+        self._seed_both_locations(db_session, "g.weird", "1.0.0", "v2?final")
+
+        result = card_svc.check_mod_availability(
+            _result_with(["g.weird"]), db_session,
+        )
+        item = result.mods[0]
+        assert item.status is CardModStatus.INSTALLED
+        assert not item.has_newer_in_repo
+        assert item.repo_mod_id is None
+
 
 # ═══════════════════════════════════════════════════════════
 # 依赖粗分类型（F17-13）

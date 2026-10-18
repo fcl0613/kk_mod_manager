@@ -6,6 +6,7 @@
   - F15-3: 依次检查游戏路径、仓库路径
   - F15-4: 标记状态（已安装/仓库有/缺失）
   - F15-8: 解析失败友好提示
+  - F15-12 (v1.7): 版本差异角标——游戏已装时比对仓库同 GUID 版本
 
 Koikatsu 卡片格式:
   角色卡/服装卡为 PNG 文件，PNG 数据之后附加了一段数据块。
@@ -28,6 +29,7 @@ import struct
 
 from sqlalchemy.orm import Session
 from loguru import logger
+from packaging.version import InvalidVersion, Version
 
 from app.models.mod import Mod, ModLocation
 from kkloader import KoikatuCharaData
@@ -73,6 +75,10 @@ class CardModItem:
     mod_id: int | None = None  # 数据库记录 ID（用于一键安装）
     location: str = ""  # 位置："game" / "repo"
 
+    # ── 版本差异角标（F15-12 / Q-04）──
+    repo_version: str = ""  # 仓库中同 GUID 的更新版本（仅 INSTALLED 且仓库版本更新时填充）
+    repo_mod_id: int | None = None  # 对应仓库行 ID（「升级」按钮的安装来源，F15-13）
+
     # ── 场景卡解析扩展（F17）──
     sources: list[str] = field(default_factory=list)  # 依赖来源标签，如 "场景物品" / "角色: 雪"
     meta_name: str = ""  # 卡内 UAR 元数据（缺失时的下载线索，F17-7）
@@ -96,6 +102,11 @@ class CardModItem:
             CardModStatus.MISSING: "缺失",
         }
         return texts[self.status]
+
+    @property
+    def has_newer_in_repo(self) -> bool:
+        """仓库中有同 GUID 的更新版本（🟢 角标条件，F15-12）"""
+        return self.status is CardModStatus.INSTALLED and self.repo_mod_id is not None
 
     @property
     def dep_type(self) -> str:
@@ -364,7 +375,8 @@ class CardService:
         检查卡片依赖的每个 Mod 在游戏和仓库中的可用性。
 
         顺序（BR-C03）：
-          ① 先查游戏 Mod 路径
+          ① 先查游戏 Mod 路径——命中后再比对仓库同 GUID 版本，
+             仓库更新则标记版本差异角标（F15-12 / Q-04，BR-C04）
           ② 再查仓库路径
             ㉃ 都没有 → 标记为缺失
 
@@ -392,6 +404,24 @@ class CardService:
                 item.mod_id = game_mod.id
                 item.location = "game"
                 installed += 1
+
+                # 版本差异角标（F15-12）：仓库同 GUID 版本更新才标记；
+                # 版本无法解析时保守不标（BR-V03 口径，避免误导）
+                repo_dup: Mod | None = (
+                    db_session.query(Mod)
+                    .filter(
+                        Mod.guid == item.guid,
+                        Mod.location == ModLocation.REPO,
+                    )
+                    .first()
+                )
+                if repo_dup is not None:
+                    try:
+                        if Version(repo_dup.version) > Version(game_mod.version):
+                            item.repo_version = repo_dup.version
+                            item.repo_mod_id = repo_dup.id
+                    except InvalidVersion:
+                        pass
                 continue
 
             # ② 查仓库中的 Mod

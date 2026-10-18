@@ -83,6 +83,22 @@ def app_config(dirs):
     cfg._config_instance = original
 
 
+@pytest.fixture(autouse=True)
+def _trash_root_isolation(tmp_path, monkeypatch):
+    """autouse 安全网（F25）：回收站根指到临时目录，测试绝不写真实 data/.trash/。
+
+    move_to_trash 经 app.database.get_data_dir 解析回收站位置，
+    这里替换该函数即可全局生效（含 mod_service 内的调用）。
+    """
+    monkeypatch.setattr("app.database.get_data_dir", lambda: tmp_path / "appdata")
+
+
+@pytest.fixture()
+def trash_root(tmp_path) -> Path:
+    """断言用：本次测试对应的回收站根目录（与 _trash_root_isolation 同源）"""
+    return tmp_path / "appdata" / ".trash"
+
+
 @pytest.fixture()
 def svc(db_session):
     """配置好临时路径的 ModService"""

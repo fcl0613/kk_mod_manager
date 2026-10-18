@@ -1,6 +1,9 @@
-"""file_utils 纯文件操作工具测试（BR-F01~F06 / BR-A02~A04）。"""
+"""file_utils 纯文件操作工具测试（BR-F01~F06 / BR-A02~A04 / F25 回收站）。"""
 
+from datetime import datetime
 from pathlib import Path
+
+import pytest
 
 from app.models.mod import Mod, ModLocation, ModStatus
 from app.utils.file_utils import (
@@ -9,14 +12,19 @@ from app.utils.file_utils import (
     compute_repo_relative_path,
     delete_file,
     derive_category_from_relpath,
+    empty_trash,
     ensure_dir,
+    fmt_size,
     get_author_dir,
+    get_trash_dir,
     infer_author_from_path,
+    move_to_trash,
     rename_extension,
     resolve_game_mod_path,
     resolve_repo_mod_path,
     safe_copy,
     safe_copy_simple,
+    trash_stats,
 )
 
 
@@ -416,3 +424,69 @@ def test_derive_category_empty_and_bare_filename():
 def test_derive_category_unknown_first_segment_none():
     """首段不在清单（如自定义目录名未登记）→ None"""
     assert derive_category_from_relpath("MyOwnDir/Makise/x.zipmod", _CATS) is None
+
+
+# ── 应用内回收站（F25）──────────────────────────────────────
+# 回收站根已由 autouse _trash_root_isolation 指到 tmp_path/appdata/.trash
+
+def test_move_to_trash_date_dir_and_keeps_name(trash_root, tmp_path):
+    """移入 data/.trash/{今天}/原文件名，源文件消失（F25-1/2）"""
+    src = _touch(tmp_path / "game" / "Xavier" / "ModA.zipmod", "body")
+    dest = move_to_trash(src)
+    today = datetime.now().strftime("%Y-%m-%d")
+    assert dest == trash_root / today / "ModA.zipmod"
+    assert dest.read_text(encoding="utf-8") == "body"
+    assert not src.exists()
+
+
+def test_move_to_trash_same_name_sequenced(trash_root, tmp_path):
+    """同日同名冲突追加 _序号（F25-2）"""
+    a1 = _touch(tmp_path / "a" / "ModA.zipmod", "1")
+    a2 = _touch(tmp_path / "b" / "ModA.zipmod", "2")
+    a3 = _touch(tmp_path / "c" / "ModA.zipmod", "3")
+    d1 = move_to_trash(a1)
+    d2 = move_to_trash(a2)
+    d3 = move_to_trash(a3)
+    assert [d1.name, d2.name, d3.name] == ["ModA.zipmod", "ModA_1.zipmod", "ModA_2.zipmod"]
+    assert len(list(d1.parent.glob("ModA*.zipmod"))) == 3
+
+
+def test_move_to_trash_disabled_suffix_preserved(trash_root, tmp_path):
+    """.zipmod_disabled 后缀保留，序号插在后缀前（对齐 safe_copy 口径）"""
+    src = _touch(tmp_path / "ModB.zipmod_disabled", "x")
+    _touch(trash_root / datetime.now().strftime("%Y-%m-%d") / "ModB.zipmod_disabled", "y")
+    dest = move_to_trash(src)
+    assert dest.name == "ModB_1.zipmod_disabled"
+
+
+def test_move_to_trash_missing_raises(tmp_path):
+    """文件不存在 → OSError（F25-5：调用方须报告失败，不得静默）"""
+    with pytest.raises(OSError):
+        move_to_trash(tmp_path / "nope.zipmod")
+
+
+def test_trash_stats_then_empty_roundtrip(trash_root, tmp_path):
+    """统计 (文件数, 字节数) 与清空（硬删全部，F25-3）"""
+    assert trash_stats() == (0, 0)   # 根不存在 → (0, 0)
+    assert empty_trash() == 0        # 空回收站清空不报错
+
+    a = _touch(tmp_path / "a" / "ModA.zipmod", "12345")     # 5 字节
+    b = _touch(tmp_path / "b" / "ModB.zipmod", "1234567890")  # 10 字节
+    move_to_trash(a)
+    move_to_trash(b)
+    count, size = trash_stats()
+    assert count == 2
+    assert size == 15
+
+    removed = empty_trash()
+    assert removed == 2
+    assert not any(trash_root.rglob("*"))
+    assert trash_stats() == (0, 0)
+
+
+def test_fmt_size_units():
+    assert fmt_size(0) == "0 B"
+    assert fmt_size(512) == "512 B"
+    assert fmt_size(2048) == "2.0 KB"
+    assert fmt_size(3 * 1024 * 1024) == "3.0 MB"
+    assert fmt_size(2 * 1024 * 1024 * 1024) == "2.0 GB"

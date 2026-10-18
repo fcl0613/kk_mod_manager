@@ -116,6 +116,11 @@ class AppConfig(BaseModel):
     clean_empty_dirs: bool = Field(
         default=True, description="卸载/移除后清理空作者目录"
     )
+    use_trash: bool = Field(
+        default=True,
+        description="删除操作默认移入应用内回收站 data/.trash/（F25，卸载/清理可找回）；"
+                    "关闭则回到硬删除",
+    )
 
     # ── 分类目录（F19）──
     category: CategoryConfig = Field(default_factory=CategoryConfig)

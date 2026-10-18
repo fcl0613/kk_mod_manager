@@ -6,7 +6,7 @@ sync_from_disk / refresh_from_disk 已由 tests/sync_service_test.py 手动脚�
 
 import os
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -1134,6 +1134,71 @@ class TestTrashIntegration:
         assert files_under(_trash_today(trash_root)) == {"ModAold.zipmod"}
         log = svc.session.query(OperationLog).filter_by(operation="dedup").one()
         assert "移入回收站 1 个重复文件" in log.detail
+
+
+# ═══════════════════════════════════════════════════════════
+# 操作日志查询 / 过期清理（F10-3/4）
+# ═══════════════════════════════════════════════════════════
+
+def _seed_log(svc, operation="install", name="ModA", created_at=None,
+              result="success", location="game"):
+    """直接插一行操作日志（查询类测试用）"""
+    log = OperationLog(
+        operation=operation, mod_name=name, mod_guid="guid.x",
+        location=location, detail="", result=result,
+        created_at=created_at or datetime.now(),
+    )
+    svc.session.add(log)
+    svc.session.commit()
+    return log
+
+
+class TestOperationLogs:
+    def test_query_time_desc_with_id_tiebreak(self, svc):
+        """时间倒序；同一时间内按插入顺序倒排（id 兜底）"""
+        t = datetime(2026, 1, 1, 12, 0, 0)
+        for i in range(3):
+            _seed_log(svc, name=f"Mod{i}", created_at=t)
+        _seed_log(svc, name="Oldest", created_at=datetime(2025, 12, 1))
+
+        assert [l.mod_name for l in svc.get_operation_logs()] == [
+            "Mod2", "Mod1", "Mod0", "Oldest",
+        ]
+
+    def test_filter_by_operation(self, svc):
+        _seed_log(svc, operation="install")
+        _seed_log(svc, operation="uninstall", name="ModB")
+        _seed_log(svc, operation="dedup", name="(重复项清理)")
+
+        logs = svc.get_operation_logs(operation="uninstall")
+        assert [l.mod_name for l in logs] == ["ModB"]
+        assert svc.get_operation_logs_count("uninstall") == 1
+        assert svc.get_operation_logs_count() == 3
+
+    def test_pagination_limit_offset(self, svc):
+        base = datetime(2026, 1, 1)
+        for i in range(5):
+            _seed_log(svc, name=f"M{i}", created_at=base + timedelta(hours=i))
+
+        page = svc.get_operation_logs(limit=2, offset=2)
+        assert [l.mod_name for l in page] == ["M2", "M1"]  # 全序 M4..M0 的第 3-4 条
+
+    def test_cleanup_old_logs_removes_only_expired(self, svc):
+        now = datetime.now()
+        _seed_log(svc, name="TooOld", created_at=now - timedelta(days=30, hours=1))
+        _seed_log(svc, name="Fresh", created_at=now - timedelta(days=29))
+        _seed_log(svc, name="Today", created_at=now)
+
+        deleted = svc.cleanup_old_logs()
+
+        assert deleted == 1
+        remaining = [l.mod_name for l in svc.get_operation_logs()]
+        assert remaining == ["Today", "Fresh"]
+
+    def test_cleanup_no_match_returns_zero_without_commit(self, svc):
+        _seed_log(svc, name="Fresh", created_at=datetime.now())
+        assert svc.cleanup_old_logs() == 0
+        assert svc.get_operation_logs_count() == 1
 
 
 class TestAddGameModToRepo:

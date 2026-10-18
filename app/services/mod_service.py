@@ -16,7 +16,7 @@
 import hashlib
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Callable
@@ -49,6 +49,9 @@ from app.utils.file_utils import (
     derive_category_from_relpath,
 )
 from app.utils.version_utils import display_version
+
+# F10-4 日志保留期限（暂定值，后续可开放为设置项）
+LOG_RETENTION_DAYS = 30
 
 
 @dataclass
@@ -1632,6 +1635,56 @@ class ModService:
             "enabled": enabled,
             "disabled": total - enabled,
         }
+
+    # ── 操作日志查询（F10-3/4）──────────────────────────────
+
+    def get_operation_logs(
+        self,
+        operation: str = "",
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[OperationLog]:
+        """查询操作日志（时间倒序，F10-3）。
+
+        Args:
+            operation: 操作类型过滤（空串 = 全部类型）
+            limit: 每页数量，None 表示不限制
+            offset: 跳过数量（分页）
+        """
+        query = self.session.query(OperationLog)
+        if operation:
+            query = query.filter(OperationLog.operation == operation)
+        query = query.order_by(
+            OperationLog.created_at.desc(), OperationLog.id.desc()
+        )
+        if limit is not None:
+            query = query.limit(limit)
+        if offset:
+            query = query.offset(offset)
+        return query.all()
+
+    def get_operation_logs_count(self, operation: str = "") -> int:
+        """获取操作日志总数（用于分页，F10-3）"""
+        query = self.session.query(OperationLog)
+        if operation:
+            query = query.filter(OperationLog.operation == operation)
+        return query.count()
+
+    def cleanup_old_logs(self, days: int = LOG_RETENTION_DAYS) -> int:
+        """删除超过保留期限的操作日志（F10-4），返回删除行数。
+
+        以 created_at 早于 {今天 - days 天} 为界（早于即删，不含恰好等于）。
+        """
+        cutoff = datetime.now() - timedelta(days=days)
+        deleted = (
+            self.session.query(OperationLog)
+            .filter(OperationLog.created_at < cutoff)
+            .delete()
+        )
+        if deleted:
+            self.session.commit()
+            logger.info("清理过期操作日志: 删除 {} 行（保留近 {} 天）", deleted, days)
+        return deleted
 
     def group_by_author(
         self,

@@ -42,6 +42,7 @@ from app.ui.batch_install_dialog import BatchInstallDialog
 from app.ui.sync_dialog import SyncDialog
 from app.ui.version_scan_dialog import VersionScanDialog
 from app.ui.duplicate_scan_dialog import DuplicateScanDialog
+from app.ui.operation_log_page import OperationLogPage
 from app.ui.card_parse_worker import CardParseWorker
 from app.utils.version_utils import display_version
 
@@ -76,6 +77,9 @@ class MainWindow(QMainWindow):
         self._mod_service = ModService(get_session())
         self._card_service = CardService()
         self._sideloader_log_service = SideloaderLogService()
+
+        # F10-4：启动时自动清理过期操作日志（保留近一个月，暂定值）
+        self._mod_service.cleanup_old_logs()
 
         # 游戏日志解析状态（F23）：最近一次日志来源与其结果视图
         self._log_path: Path | None = None
@@ -136,6 +140,10 @@ class MainWindow(QMainWindow):
         self.card_page.game_log_requested.connect(self._on_game_log_parse)
         self.page_stack.addWidget(self.card_page)
 
+        # Page 2: 操作日志页面（F10-3）
+        self.log_page = OperationLogPage(self._mod_service)
+        self.page_stack.addWidget(self.log_page)
+
         main_layout.addWidget(self.page_stack, 1)
 
         # ── 状态栏 ──
@@ -148,6 +156,7 @@ class MainWindow(QMainWindow):
         self.top_tab_bar = QTabBar()
         self.top_tab_bar.addTab("📦 Mod 管理")
         self.top_tab_bar.addTab("📋 解析卡片")
+        self.top_tab_bar.addTab("📜 操作日志")
         self.top_tab_bar.currentChanged.connect(self._on_top_tab_changed)
 
         # 设置 TabBar 样式
@@ -352,6 +361,9 @@ class MainWindow(QMainWindow):
                     self.card_page.set_log_result(result, entries)
             elif self._card_result is not None:
                 self.card_page.set_card_result(self._card_result)
+        elif index == 2:
+            # 切换到操作日志页：拉最新日志（F10-3）
+            self.log_page.refresh()
 
     def switch_to_card_page(self):
         """切换到卡片解析页面"""
@@ -948,7 +960,10 @@ class MainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════
 
     def _refresh_current(self):
-        """刷新当前 Mod Tab 的列表"""
+        """刷新当前页面的列表（Mod 管理页按内层 Tab；日志页直接刷新）"""
+        if self.page_stack.currentIndex() == 2:
+            self.log_page.refresh()
+            return
         idx = self.tab_widget.currentIndex()
         if idx == 0:
             self._refresh_game_list()

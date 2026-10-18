@@ -234,7 +234,7 @@ class ModService:
         )
 
         if dup.is_blocked:
-            logger.info("安装被阻止（同版本已存在）: {} v{}", manifest.name, display_version(manifest.version))
+            logger.info("安装被阻止（同版本已存在）: {} {}", manifest.name, display_version(manifest.version))
             return InstallResult(
                 success=False,
                 message=(
@@ -247,7 +247,7 @@ class ModService:
 
         if dup.needs_confirmation:
             if dup.result == DuplicateResult.NEWER_VERSION and not confirm_upgrade:
-                logger.info("需要确认升级: {} v{} → v{}", manifest.name, display_version(dup.existing_version), display_version(manifest.version))
+                logger.info("需要确认升级: {} {} → {}", manifest.name, display_version(dup.existing_version), display_version(manifest.version))
                 return InstallResult(
                     success=False,
                     message="NEWER_VERSION_NEEDS_CONFIRM",
@@ -255,7 +255,7 @@ class ModService:
                     manifest=manifest,
                 )
             if dup.result == DuplicateResult.OLDER_VERSION and not confirm_downgrade:
-                logger.info("需要确认降级: {} v{} → v{}", manifest.name, display_version(dup.existing_version), display_version(manifest.version))
+                logger.info("需要确认降级: {} {} → {}", manifest.name, display_version(dup.existing_version), display_version(manifest.version))
                 return InstallResult(
                     success=False,
                     message="OLDER_VERSION_NEEDS_CONFIRM",
@@ -286,7 +286,7 @@ class ModService:
 
         # 5. 复制成功后移除旧版本（升级/降级）
         if dup.existing_mod is not None:
-            logger.info("移除旧版本: {} v{} (GUID={})", manifest.name, display_version(dup.existing_version), manifest.guid)
+            logger.info("移除旧版本: {} {} (GUID={})", manifest.name, display_version(dup.existing_version), manifest.guid)
             self._remove_mod_files(dup.existing_mod, config.game_mod_path)
             self.session.delete(dup.existing_mod)
             self.session.flush()
@@ -373,7 +373,7 @@ class ModService:
         )
 
         if dup.is_blocked:
-            logger.info("添加到仓库被阻止（同版本已存在）: {} v{}", manifest.name, display_version(manifest.version))
+            logger.info("添加到仓库被阻止（同版本已存在）: {} {}", manifest.name, display_version(manifest.version))
             return InstallResult(
                 success=False,
                 message=f"仓库中已存在相同版本的 Mod：{manifest.name} {display_version(manifest.version)}",
@@ -680,7 +680,7 @@ class ModService:
             .first()
         )
         if game_dup is not None and game_dup.version == repo_mod.version:
-            logger.info("从仓库安装被跳过（游戏已安装同版本）: {} v{}", repo_mod.name, display_version(repo_mod.version))
+            logger.info("从仓库安装被跳过（游戏已安装同版本）: {} {}", repo_mod.name, display_version(repo_mod.version))
             return InstallResult(
                 success=False,
                 message=f"游戏已安装相同版本：{repo_mod.name} {display_version(repo_mod.version)}",
@@ -707,7 +707,7 @@ class ModService:
                 file_name=src_file.name,
                 version=repo_mod.version,
             )
-            logger.info("从仓库安装成功: {} v{} → {}", repo_mod.name, display_version(repo_mod.version), dest_file)
+            logger.info("从仓库安装成功: {} {} → {}", repo_mod.name, display_version(repo_mod.version), dest_file)
         except OSError as e:
             logger.error("从仓库安装文件复制失败: {} - {}", src_file.name, e)
             return InstallResult(
@@ -717,7 +717,7 @@ class ModService:
 
         # 复制成功后移除游戏旧版本（升级）
         if game_dup is not None:
-            logger.info("从仓库安装 - 移除游戏旧版本: {} v{}", game_dup.name, display_version(game_dup.version))
+            logger.info("从仓库安装 - 移除游戏旧版本: {} {}", game_dup.name, display_version(game_dup.version))
             self._remove_mod_files(game_dup, config.game_mod_path)
             self.session.delete(game_dup)
             self.session.flush()
@@ -792,7 +792,7 @@ class ModService:
             .first()
         )
         if repo_dup is not None and repo_dup.version == game_mod.version:
-            logger.info("添加到仓库被跳过（仓库已存在同版本）: {} v{}", game_mod.name, display_version(game_mod.version))
+            logger.info("添加到仓库被跳过（仓库已存在同版本）: {} {}", game_mod.name, display_version(game_mod.version))
             return InstallResult(
                 success=False,
                 message=f"仓库中已存在相同版本：{game_mod.name} {display_version(game_mod.version)}",
@@ -820,7 +820,7 @@ class ModService:
                 file_name=src_file.name,
                 version=game_mod.version,
             )
-            logger.info("添加到仓库成功: {} v{} → {}", game_mod.name, display_version(game_mod.version), dest_file)
+            logger.info("添加到仓库成功: {} {} → {}", game_mod.name, display_version(game_mod.version), dest_file)
         except OSError as e:
             logger.error("添加到仓库文件复制失败: {} - {}", src_file.name, e)
             return InstallResult(
@@ -830,7 +830,7 @@ class ModService:
 
         # 复制成功后移除仓库旧版本（升级）
         if repo_dup is not None:
-            logger.info("添加到仓库 - 移除仓库旧版本: {} v{}", repo_dup.name, display_version(repo_dup.version))
+            logger.info("添加到仓库 - 移除仓库旧版本: {} {}", repo_dup.name, display_version(repo_dup.version))
             self._remove_mod_files(repo_dup, config.repo_path)
             self.session.delete(repo_dup)
             self.session.flush()
@@ -1548,7 +1548,7 @@ class ModService:
 
         if dup.is_blocked:
             # 同版本已存在，跳过
-            logger.debug("批量安装 - 跳过（同版本）: {} v{}", manifest.name, display_version(manifest.version))
+            logger.debug("批量安装 - 跳过（同版本）: {} {}", manifest.name, display_version(manifest.version))
             return BatchItemResult(
                 file_path=fp,
                 status=BatchItemStatus.SKIPPED,
@@ -1560,7 +1560,7 @@ class ModService:
         if dup.needs_confirmation:
             # 版本不同，记录为冲突，不自动处理
             logger.debug(
-                "批量安装 - 版本冲突: {} 已有=v{} 待装=v{}",
+                "批量安装 - 版本冲突: {} 已有={} 待装={}",
                 manifest.name, display_version(dup.existing_version),
                 display_version(manifest.version),
             )
@@ -1638,7 +1638,7 @@ class ModService:
         )
         self.session.commit()
 
-        logger.debug("批量安装 - 成功: {} v{}", manifest.name, display_version(manifest.version))
+        logger.debug("批量安装 - 成功: {} {}", manifest.name, display_version(manifest.version))
         return BatchItemResult(
             file_path=fp,
             status=BatchItemStatus.SUCCESS,

@@ -289,3 +289,38 @@ def infer_author_from_path(
         if part.lower() not in category_lower:
             return part
     return None
+
+
+def derive_category_from_relpath(
+    rel_path: str,
+    category_names: list[str] | set[str],
+) -> str | None:
+    """从 GAME 端相对路径推导 F19 分类（F24 升级保位用）。
+
+    game_relative_path 形如 "ForCharactersLoading/Makise/[x].zipmod"：
+    首段命中分类清单（大小写不敏感，BR-CAT01 口径）→ 返回清单中的规范名
+    （保证 get_author_dir 能大小写不敏感找回原目录，目录被删后也能按规范名重建）；
+    首段不是分类（F19 前的平铺老布局 "Makise/x.zipmod"）或路径为空 → None
+    （升级回退 {作者}/ 平铺，与该行当前布局一致，不发生隐式搬家）。
+    分类总开关 game_category_enabled=False 时由 _game_target_dir 自行回退平铺，
+    本函数无需感知开关状态。
+
+    Args:
+        rel_path: Mod 行持久化的 game_relative_path（POSIX 风格，可为空）
+        category_names: 分类目录名清单
+
+    Returns:
+        分类规范名，或 None（无分类段）
+    """
+    rel = (rel_path or "").strip()
+    if not rel:
+        return None
+    parts = PurePosixPath(rel).parts
+    if len(parts) < 2:
+        return None  # 文件直躺根下 → 无分类段
+    first = parts[0]
+    for category in category_names:
+        name = str(category).strip()
+        if name and name.lower() == first.lower():
+            return name  # 返回清单中的规范名，非磁盘原样大小写
+    return None

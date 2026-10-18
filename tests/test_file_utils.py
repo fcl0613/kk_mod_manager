@@ -8,6 +8,7 @@ from app.utils.file_utils import (
     compute_relative_path,
     compute_repo_relative_path,
     delete_file,
+    derive_category_from_relpath,
     ensure_dir,
     get_author_dir,
     infer_author_from_path,
@@ -385,3 +386,33 @@ def test_clean_empty_dirs_exclude_case_insensitive(tmp_path):
     assert cleaned == 1
     assert (root / "ForCharactersLoading").is_dir()
     assert not (root / "gone").exists()
+
+
+# ── derive_category_from_relpath（F24 升级保位）──────────────
+
+_CATS = ["AdditionalPoses", "ForCharactersLoading", "ForStudioScenesLoading"]
+
+
+def test_derive_category_hit():
+    assert derive_category_from_relpath("ForCharactersLoading/Makise/x.zipmod", _CATS) == "ForCharactersLoading"
+
+
+def test_derive_category_case_insensitive_returns_canonical():
+    """磁盘/存量数据大小写不一致 → 返回清单中的规范名"""
+    assert derive_category_from_relpath("forcharactersloading/Makise/x.zipmod", _CATS) == "ForCharactersLoading"
+
+
+def test_derive_category_flat_layout_none():
+    """平铺老布局 {作者}/x.zipmod → None（升级回平铺，不隐式搬家）"""
+    assert derive_category_from_relpath("Makise/x.zipmod", _CATS) is None
+
+
+def test_derive_category_empty_and_bare_filename():
+    assert derive_category_from_relpath("", _CATS) is None
+    assert derive_category_from_relpath(None, _CATS) is None  # type: ignore[arg-type]
+    assert derive_category_from_relpath("x.zipmod", _CATS) is None
+
+
+def test_derive_category_unknown_first_segment_none():
+    """首段不在清单（如自定义目录名未登记）→ None"""
+    assert derive_category_from_relpath("MyOwnDir/Makise/x.zipmod", _CATS) is None

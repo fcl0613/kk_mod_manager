@@ -574,6 +574,274 @@ class TestInstallFromRepo:
         assert not res.success
         assert "仓库中文件不存在" in res.message
 
+    def test_upgrade_preserves_disabled_status(self, svc, dirs, db_session):
+        """F24-6: 升级保留游戏行禁用状态（状态与磁盘扩展名同步修改）"""
+        v1 = make_zipmod(dirs.root / "v1", "RepoMod", "guid.r", version="1.0.0",
+                         author="Xavier")
+        repo_mod = svc.add_to_repo(v1).mod
+        game_mod = svc.install_from_repo(repo_mod.id).mod
+        assert svc.set_enabled(game_mod.id, enabled=False).success  # 禁用旧版
+
+        v2 = make_zipmod(dirs.root / "v2", "RepoMod", "guid.r", version="2.0.0",
+                         author="Xavier")
+        new_repo_mod = svc.add_to_repo(v2, confirm_upgrade=True).mod
+        res = svc.install_from_repo(new_repo_mod.id)
+
+        assert res.success
+        game_now = svc.get_game_mod_by_guid("guid.r")
+        assert game_now.status == ModStatus.DISABLED
+        # 磁盘扩展名同步为 _disabled（否则下次同步会按后缀把状态改回启用）
+        assert files_under(dirs.game) == {"Xavier/RepoModv2.0.0.zipmod_disabled"}
+        log = (db_session.query(OperationLog)
+               .filter(OperationLog.operation == "install")
+               .order_by(OperationLog.id.desc()).first())
+        assert "保持禁用" in log.detail
+
+    def test_disabled_rename_failure_falls_back_enabled(self, svc, dirs, monkeypatch):
+        """F24-6: _disabled 改名失败 → 降级为启用态，不阻断升级本身"""
+        v1 = make_zipmod(dirs.root / "v1", "RepoMod", "guid.r", version="1.0.0",
+                         author="Xavier")
+        repo_mod = svc.add_to_repo(v1).mod
+        game_mod = svc.install_from_repo(repo_mod.id).mod
+        assert svc.set_enabled(game_mod.id, enabled=False).success
+        v2 = make_zipmod(dirs.root / "v2", "RepoMod", "guid.r", version="2.0.0",
+                         author="Xavier")
+        new_repo_mod = svc.add_to_repo(v2, confirm_upgrade=True).mod
+
+        # set_enabled 已完成（用了真 rename），此刻起让 rename_extension 失败
+        monkeypatch.setattr(
+            "app.services.mod_service.rename_extension",
+            lambda path, old_suffix, new_suffix: None,
+        )
+        res = svc.install_from_repo(new_repo_mod.id)
+
+        assert res.success
+        game_now = svc.get_game_mod_by_guid("guid.r")
+        assert game_now.status == ModStatus.ENABLED
+        assert files_under(dirs.game) == {"Xavier/RepoModv2.0.0.zipmod"}
+
+
+# ═══════════════════════════════════════════════════════════
+# 仓库版本巡检 scan_repo_versions（F24-1）
+# ═══════════════════════════════════════════════════════════
+
+class TestScanRepoVersions:
+    def test_repo_newer_listed_as_upgradable(self, svc, db_session):
+        g = seed_mod(db_session, "guid.g", "ModG", "Makise", version="1.0.0")
+        r = seed_mod(db_session, "guid.g", "ModG", "Makise", version="2.0.0",
+                     location=ModLocation.REPO)
+
+        report = svc.scan_repo_versions()
+
+        assert len(report.repo_newer) == 1 and not report.game_newer
+        item = report.repo_newer[0]
+        assert item.guid == "guid.g"
+        assert item.game_version == "1.0.0" and item.repo_version == "2.0.0"
+        assert item.game_mod_id == g.id and item.repo_mod_id == r.id
+        assert item.name == "ModG" and item.author == "Makise"
+        assert item.category is None  # 未持久化 game_relative_path → 平铺
+        assert report.scanned_game == 1 and report.scanned_repo == 1
+
+    def test_game_newer_listed_readonly(self, svc, db_session):
+        seed_mod(db_session, "guid.g", "ModG", "Makise", version="3.0.0")
+        seed_mod(db_session, "guid.g", "ModG", "Makise", version="2.0.0",
+                 location=ModLocation.REPO)
+
+        report = svc.scan_repo_versions()
+
+        assert len(report.game_newer) == 1 and not report.repo_newer
+
+    def test_equal_versions_not_listed(self, svc, db_session):
+        seed_mod(db_session, "guid.a", "ModA", "Makise", version="1.0.0")
+        seed_mod(db_session, "guid.a", "ModA", "Makise", version="1.0.0",
+                 location=ModLocation.REPO)
+        # "1.0" vs "v1.0"：原始串不等但解析后相等 → 同样不列
+        seed_mod(db_session, "guid.b", "ModB", "Makise", version="1.0")
+        seed_mod(db_session, "guid.b", "ModB", "Makise", version="v1.0",
+                 location=ModLocation.REPO)
+
+        report = svc.scan_repo_versions()
+
+        assert not report.repo_newer and not report.game_newer
+        assert report.skipped_unparseable == 0
+
+    def test_invalid_version_excluded_br_v03(self, svc, db_session):
+        """BR-V03：任一侧版本不可解析 → 配对整体出局，不断言新旧"""
+        seed_mod(db_session, "guid.x", "ModX", "Makise", version="1.0.0")
+        seed_mod(db_session, "guid.x", "ModX", "Makise", version="not a version!",
+                 location=ModLocation.REPO)
+        seed_mod(db_session, "guid.y", "ModY", "Makise", version="still bad!")
+        seed_mod(db_session, "guid.y", "ModY", "Makise", version="1.0.0",
+                 location=ModLocation.REPO)
+
+        report = svc.scan_repo_versions()
+
+        assert not report.repo_newer and not report.game_newer
+        assert report.skipped_unparseable == 2
+
+    def test_guid_single_sided_excluded(self, svc, db_session):
+        """GUID 仅单侧存在 → 不是版本差异，不参与"""
+        seed_mod(db_session, "guid.only_game", "A", "Makise", version="1.0.0")
+        seed_mod(db_session, "guid.only_repo", "B", "Makise", version="2.0.0",
+                 location=ModLocation.REPO)
+
+        report = svc.scan_repo_versions()
+
+        assert not report.repo_newer and not report.game_newer
+        assert report.scanned_game == 1 and report.scanned_repo == 1
+
+    def test_derives_category_from_game_relpath(self, svc, db_session):
+        seed_mod(db_session, "guid.hit", "Hit", "Makise", version="1.0.0",
+                 file_name="Hit.zipmod")
+        seed_mod(db_session, "guid.hit", "Hit", "Makise", version="2.0.0",
+                 location=ModLocation.REPO)
+        g_hit = db_session.query(Mod).filter_by(guid="guid.hit", location=ModLocation.GAME).one()
+        g_hit.game_relative_path = "ForCharactersLoading/Makise/Hit.zipmod"
+
+        seed_mod(db_session, "guid.case", "Case", "Makise", version="1.0.0",
+                 file_name="Case.zipmod")
+        seed_mod(db_session, "guid.case", "Case", "Makise", version="2.0.0",
+                 location=ModLocation.REPO)
+        g_case = db_session.query(Mod).filter_by(guid="guid.case", location=ModLocation.GAME).one()
+        g_case.game_relative_path = "forcharactersloading/Makise/Case.zipmod"  # 大小写不一致
+
+        seed_mod(db_session, "guid.flat", "Flat", "Makise", version="1.0.0")
+        seed_mod(db_session, "guid.flat", "Flat", "Makise", version="2.0.0",
+                 location=ModLocation.REPO)
+        db_session.commit()
+
+        report = svc.scan_repo_versions()
+        by_guid = {i.guid: i for i in report.repo_newer}
+
+        assert by_guid["guid.hit"].category == "ForCharactersLoading"
+        assert by_guid["guid.case"].category == "ForCharactersLoading"  # 规范名
+        assert by_guid["guid.flat"].category is None                    # 平铺老布局
+
+    def test_scan_writes_aggregate_log_only_when_diff(self, svc, db_session):
+        seed_mod(db_session, "guid.g", "ModG", "Makise", version="1.0.0")
+        r = seed_mod(db_session, "guid.g", "ModG", "Makise", version="2.0.0",
+                     location=ModLocation.REPO)
+
+        svc.scan_repo_versions()
+        assert db_op_count(svc, "upgrade") == 1
+        log = svc.session.query(OperationLog).filter_by(operation="upgrade").one()
+        assert log.mod_name == "(仓库版本巡检)"
+        assert "仓库更新 1 项" in log.detail
+
+        # 消除差异后再巡检 → 不再新增聚合日志
+        r.version = "1.0.0"
+        db_session.commit()
+        svc.scan_repo_versions()
+        assert db_op_count(svc, "upgrade") == 1
+
+
+# ═══════════════════════════════════════════════════════════
+# 一键升级 batch_upgrade_from_repo（F24-2/4/5）
+# ═══════════════════════════════════════════════════════════
+
+def _seed_upgradable_pair(svc, dirs, tag, guid, name, author,
+                          v1="1.0.0", v2="2.0.0", category=None):
+    """造一对可升级数据：游戏装 v1 → 仓库升 v2，返回新 REPO 行"""
+    f1 = make_zipmod(dirs.root / f"{tag}-v1", name, guid, version=v1, author=author)
+    repo1 = svc.add_to_repo(f1).mod
+    assert svc.install_from_repo(repo1.id, category=category).success
+    f2 = make_zipmod(dirs.root / f"{tag}-v2", name, guid, version=v2, author=author)
+    repo2 = svc.add_to_repo(f2, confirm_upgrade=True).mod
+    return repo2
+
+
+class TestBatchUpgradeFromRepo:
+    def test_success_path_replaces_game_file(self, svc, dirs, db_session):
+        repo2 = _seed_upgradable_pair(svc, dirs, "a", "guid.a", "ModA", "Xavier")
+
+        report = svc.scan_repo_versions()
+        assert len(report.repo_newer) == 1
+        result = svc.batch_upgrade_from_repo([report.repo_newer[0].repo_mod_id])
+
+        assert result.success_count == 1 and result.failed_count == 0
+        assert svc.get_game_mod_by_guid("guid.a").version == "2.0.0"
+        assert files_under(dirs.game) == {"Xavier/ModAv2.0.0.zipmod"}  # 旧文件已删
+        # v1 装入 + 批量升级各写一条 install 日志（add_to_repo 走 repo_add 不计）
+        assert db_op_count(svc, "install") == 2
+
+    def test_progress_callback_shape(self, svc, dirs):
+        """进度回调与 batch_install 同形：每项前 (idx,total,name) + 末次 ("完成") 哨兵"""
+        repo_a = _seed_upgradable_pair(svc, dirs, "a", "guid.a", "ModA", "Xavier")
+        repo_b = _seed_upgradable_pair(svc, dirs, "b", "guid.b", "ModB", "Yuri")
+
+        progress = MagicMock()
+        result = svc.batch_upgrade_from_repo([repo_a.id, repo_b.id],
+                                             progress_callback=progress)
+
+        assert result.success_count == 2
+        assert progress.call_count == 3  # 2 项 + 完成哨兵
+        assert progress.call_args == ((2, 2, "完成"),)
+        assert progress.call_args_list[0].args[:2] == (0, 2)
+
+    def test_same_version_mid_batch_skipped(self, svc, dirs):
+        """扫描后游戏侧已被单发更新到仓库版本 → 批量该项按 SKIPPED 消化"""
+        repo2 = _seed_upgradable_pair(svc, dirs, "a", "guid.a", "ModA", "Xavier")
+        assert svc.install_from_repo(repo2.id).success  # 先手动升级到 v2
+
+        result = svc.batch_upgrade_from_repo([repo2.id])
+
+        assert result.skipped_count == 1 and result.success_count == 0
+        assert result.items[0].status is BatchItemStatus.SKIPPED
+        assert "游戏已安装相同版本" in result.items[0].message
+
+    def test_preserves_category_dir_on_disk(self, svc, dirs):
+        """分类布局的 Mod 升级不搬家：新文件仍落在 {分类}/{作者}/ 下"""
+        repo2 = _seed_upgradable_pair(svc, dirs, "a", "guid.a", "ModA", "Xavier",
+                                      category="ForCharactersLoading")
+        assert files_under(dirs.game) == {"ForCharactersLoading/Xavier/ModA.zipmod"}
+
+        result = svc.batch_upgrade_from_repo([repo2.id])  # 不传分类，服务端自行推导
+
+        assert result.success_count == 1
+        assert files_under(dirs.game) == {"ForCharactersLoading/Xavier/ModAv2.0.0.zipmod"}
+        game_row = svc.get_game_mod_by_guid("guid.a")
+        assert game_row.game_relative_path.startswith("ForCharactersLoading/")
+
+    def test_copy_failure_mid_batch_continues(self, svc, dirs, monkeypatch):
+        """单项复制失败不中断批量：前项 SUCCESS、失败项游戏侧原样"""
+        from app.services import mod_service as ms
+
+        repo_a = _seed_upgradable_pair(svc, dirs, "a", "guid.a", "ModA", "Xavier")
+        repo_b = _seed_upgradable_pair(svc, dirs, "b", "guid.b", "ModB", "Yuri")
+
+        real_safe_copy = ms.safe_copy
+        calls = {"n": 0}
+
+        def _flaky_copy(src, dst_dir, file_name, version):
+            calls["n"] += 1
+            if calls["n"] >= 2:  # 批量第二项（setup 已完成，monkeypatch 后从零计数）
+                raise OSError("boom on second copy")
+            return real_safe_copy(src, dst_dir, file_name, version)
+
+        monkeypatch.setattr("app.services.mod_service.safe_copy", _flaky_copy)
+        result = svc.batch_upgrade_from_repo([repo_a.id, repo_b.id])
+
+        assert result.success_count == 1 and result.failed_count == 1
+        assert result.items[0].status is BatchItemStatus.SUCCESS
+        assert result.items[1].status is BatchItemStatus.FAILED
+        assert "文件复制失败" in result.items[1].message
+        # 失败项游戏行/旧文件原样（F04-8）
+        assert svc.get_game_mod_by_guid("guid.b").version == "1.0.0"
+        assert files_under(dirs.game) == {
+            "Xavier/ModAv2.0.0.zipmod",
+            "Yuri/ModB.zipmod",
+        }
+
+    def test_paths_not_configured_all_failed(self, svc, dirs):
+        repo2 = _seed_upgradable_pair(svc, dirs, "a", "guid.a", "ModA", "Xavier")
+
+        set_config(game_mod_path="")
+        result = svc.batch_upgrade_from_repo([repo2.id])
+
+        assert result.total == 1 and result.failed_count == 1
+        assert result.items[0].status is BatchItemStatus.FAILED
+        assert "未配置" in result.items[0].message
+
 
 class TestAddGameModToRepo:
     def test_success_copies_to_repo(self, svc, dirs):

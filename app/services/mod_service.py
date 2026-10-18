@@ -22,6 +22,7 @@ from typing import Callable
 
 from sqlalchemy.orm import Session
 from loguru import logger
+from packaging.version import InvalidVersion, Version
 
 from app.config import get_config
 from app.models.mod import Mod, ModLocation, ModStatus, OperationLog
@@ -43,6 +44,7 @@ from app.utils.file_utils import (
     resolve_repo_mod_path,
     resolve_game_mod_path,
     infer_author_from_path,
+    derive_category_from_relpath,
 )
 from app.utils.version_utils import display_version
 
@@ -144,6 +146,63 @@ class SyncReport:
             f"删除 {len(self.removed)} | 更新 {len(self.updated)} | "
             f"解析失败 {len(self.parse_failures)}"
         )
+
+
+# ═══════════════════════════════════════════════════════════
+# 仓库版本巡检相关数据类（F24）
+# ═══════════════════════════════════════════════════════════
+
+
+@dataclass
+class VersionDiffItem:
+    """F24 巡检单项：GAME 与 REPO 同 GUID 的版本差异"""
+    guid: str
+    name: str                  # 展示名（GAME/REPO 同名）
+    author: str
+    game_version: str          # 原始字符串（展示层走 display_version）
+    repo_version: str
+    game_mod_id: int           # GAME 行 ID（参考）
+    repo_mod_id: int           # REPO 行 ID（升级目标）
+    category: str | None = None  # 由 game_relative_path 首段推导的 F19 分类；None=平铺布局
+
+
+@dataclass
+class VersionScanReport:
+    """仓库版本巡检报告（F24-1）"""
+    repo_newer: list[VersionDiffItem] = field(default_factory=list)   # 仓库更新（可升级）
+    game_newer: list[VersionDiffItem] = field(default_factory=list)   # 游戏更新（仅参考，F24-3）
+    scanned_game: int = 0
+    scanned_repo: int = 0
+    skipped_unparseable: int = 0    # BR-V03 排除（任一侧不可解析）的配对数
+
+    def summary(self) -> str:
+        """一行中文摘要（供 UI / 操作日志使用，对齐 SyncReport.summary）"""
+        return (
+            f"仓库版本巡检：对比 GAME {self.scanned_game} 行 / REPO {self.scanned_repo} 行 | "
+            f"仓库更新 {len(self.repo_newer)} 项 | 游戏更新 {len(self.game_newer)} 项 | "
+            f"版本不可比 {self.skipped_unparseable} 对（已忽略）"
+        )
+
+
+@dataclass
+class UpgradeItemResult:
+    """F24 批量升级单项结果"""
+    guid: str
+    name: str
+    game_version: str          # 升级前的游戏版本（原始字符串）
+    repo_version: str
+    status: BatchItemStatus = BatchItemStatus.PENDING   # 复用批量安装状态枚举
+    message: str = ""
+
+
+@dataclass
+class BatchUpgradeResult:
+    """F24 批量升级总结果"""
+    total: int = 0
+    success_count: int = 0
+    skipped_count: int = 0
+    failed_count: int = 0
+    items: list[UpgradeItemResult] = field(default_factory=list)
 
 
 def _normalize_author(author: str | None) -> str:
@@ -715,6 +774,18 @@ class ModService:
                 message=f"文件复制失败：{e}",
             )
 
+        # F24-6: 升级保留游戏行禁用状态——状态必须与磁盘扩展名同步修改，
+        # 否则下次磁盘同步会按文件后缀把状态改回启用、set_enabled 也会
+        # 解析到不存在的 _disabled 路径；改名失败降级为启用态，不阻断升级
+        preserve_disabled = game_dup is not None and game_dup.status == ModStatus.DISABLED
+        final_file = dest_file
+        if preserve_disabled and dest_file.suffix.lower() == ".zipmod":
+            renamed = rename_extension(dest_file, ".zipmod", ".zipmod_disabled")
+            if renamed is not None:
+                final_file = renamed
+            else:
+                preserve_disabled = False
+
         # 复制成功后移除游戏旧版本（升级）
         if game_dup is not None:
             logger.info("从仓库安装 - 移除游戏旧版本: {} {}", game_dup.name, display_version(game_dup.version))
@@ -730,11 +801,11 @@ class ModService:
             author_normalized=repo_mod.author_normalized,
             description=repo_mod.description,
             website=repo_mod.website,
-            file_name=dest_file.name,
+            file_name=final_file.name,
             location=ModLocation.GAME,
-            status=ModStatus.ENABLED,
+            status=ModStatus.DISABLED if preserve_disabled else ModStatus.ENABLED,
             installed_at=datetime.now(),
-            game_relative_path=compute_relative_path(game_path, dest_file),
+            game_relative_path=compute_relative_path(game_path, final_file),
         )
         self.session.add(game_mod)
 
@@ -743,7 +814,10 @@ class ModService:
             mod_name=repo_mod.name,
             mod_guid=repo_mod.guid,
             location="game",
-            detail=f"从仓库安装 {display_version(repo_mod.version)}",
+            detail=(
+                f"从仓库安装 {display_version(repo_mod.version)}"
+                + ("（保持禁用）" if preserve_disabled else "")
+            ),
         )
 
         self.session.commit()
@@ -866,6 +940,172 @@ class ModService:
             message=f"已加入仓库：{game_mod.name} {display_version(game_mod.version)}",
             mod=repo_mod,
         )
+
+    # ═══════════════════════════════════════════════════════════
+    # 仓库版本巡检 / 一键升级（F24）
+    # ═══════════════════════════════════════════════════════════
+
+    def scan_repo_versions(self) -> VersionScanReport:
+        """全表对比 GAME 与 REPO 同 GUID 版本（F24-1）。
+
+        - packaging.Version 严格比较；BR-V03 保守口径：任一侧 InvalidVersion
+          → 该配对整体不参与（既不算仓库更新也不算游戏更新）
+        - 版本相等（含 "1.0" vs "v1.0" 这类解析后相等的原始串）→ 不列出
+        - GUID 仅单侧存在 → 不参与（不是版本差异）
+        - 纯 DB 查询 + 内存比较，不触碰磁盘；有差异时记一条聚合操作日志
+        """
+        report = VersionScanReport()
+        game_mods = self.session.query(Mod).filter(Mod.location == ModLocation.GAME).all()
+        repo_by_guid = {
+            m.guid: m
+            for m in self.session.query(Mod).filter(Mod.location == ModLocation.REPO).all()
+        }
+        report.scanned_game = len(game_mods)
+        report.scanned_repo = len(repo_by_guid)
+        category_names = get_config().category.category_names
+
+        for game_mod in game_mods:
+            repo_mod = repo_by_guid.get(game_mod.guid)
+            if repo_mod is None:
+                continue  # GUID 单侧存在 → 不是版本差异
+            try:
+                game_v = Version(game_mod.version)
+                repo_v = Version(repo_mod.version)
+            except InvalidVersion:
+                # BR-V03：版本无法解析时不断言新旧，配对整体排除
+                report.skipped_unparseable += 1
+                continue
+            if repo_v > game_v:
+                report.repo_newer.append(
+                    VersionDiffItem(
+                        guid=game_mod.guid,
+                        name=game_mod.name or repo_mod.name or game_mod.guid,
+                        author=game_mod.author or repo_mod.author or "",
+                        game_version=game_mod.version,
+                        repo_version=repo_mod.version,
+                        game_mod_id=game_mod.id,
+                        repo_mod_id=repo_mod.id,
+                        category=derive_category_from_relpath(
+                            game_mod.game_relative_path, category_names
+                        ),
+                    )
+                )
+            elif game_v > repo_v:
+                # 游戏更新（降级方向）：仅参考展示，不推导分类（F24-3 不可操作）
+                report.game_newer.append(
+                    VersionDiffItem(
+                        guid=game_mod.guid,
+                        name=game_mod.name or repo_mod.name or game_mod.guid,
+                        author=game_mod.author or repo_mod.author or "",
+                        game_version=game_mod.version,
+                        repo_version=repo_mod.version,
+                        game_mod_id=game_mod.id,
+                        repo_mod_id=repo_mod.id,
+                    )
+                )
+            # 相等 → 不列出
+
+        if report.repo_newer or report.game_newer:
+            self._log_operation(
+                operation="upgrade",
+                mod_name="(仓库版本巡检)",
+                mod_guid="",
+                location="game",
+                detail=report.summary()[:450],
+            )
+            self.session.commit()
+
+        logger.info("仓库版本巡检完成: {}", report.summary())
+        return report
+
+    def batch_upgrade_from_repo(
+        self,
+        repo_mod_ids: list[int],
+        progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> BatchUpgradeResult:
+        """按巡检结果批量从仓库升级游戏侧（F24-2/4/5）。
+
+        逐项复用 install_from_repo（F04-8 防丢序 + 逐项 OperationLog + 单项独立 commit）。
+        分类在执行时从 GAME 行 game_relative_path 现场推导（保证与磁盘当前布局
+        一致，避免分类布局的 Mod 被隐式搬到平铺目录）；游戏行已不在（被卸载）
+        → 按 None 平铺安装走全新安装分支。单项失败/意外异常不中断批量。
+        """
+        result = BatchUpgradeResult(total=len(repo_mod_ids))
+        config = get_config()
+
+        # 前置路径校验（镜像 batch_install 口径）：两侧任一未配置 → 全部 FAILED
+        if not config.game_mod_path or not config.repo_path:
+            reason = (
+                "未配置游戏 Mod 路径，请先在设置中配置"
+                if not config.game_mod_path
+                else "未配置仓库路径，请先在设置中配置"
+            )
+            for repo_mod_id in repo_mod_ids:
+                item = UpgradeItemResult(guid="", name=f"ID={repo_mod_id}", game_version="", repo_version="",
+                                         status=BatchItemStatus.FAILED, message=reason)
+                result.items.append(item)
+                result.failed_count += 1
+            return result
+
+        category_names = config.category.category_names
+        total = len(repo_mod_ids)
+        for idx, repo_mod_id in enumerate(repo_mod_ids):
+            repo_mod = self.session.get(Mod, repo_mod_id)
+            name = repo_mod.name if repo_mod is not None else f"ID={repo_mod_id}"
+            if progress_callback:
+                progress_callback(idx, total, name)
+
+            game_row = (
+                self.get_game_mod_by_guid(repo_mod.guid) if repo_mod is not None else None
+            )
+            item = UpgradeItemResult(
+                guid=repo_mod.guid if repo_mod is not None else "",
+                name=name,
+                game_version=game_row.version if game_row is not None else "",
+                repo_version=repo_mod.version if repo_mod is not None else "",
+            )
+            category = (
+                derive_category_from_relpath(game_row.game_relative_path, category_names)
+                if game_row is not None
+                else None
+            )
+            try:
+                res = self.install_from_repo(repo_mod_id, category)
+            except Exception as e:  # noqa: BLE001 - 单项意外异常回滚后继续批量
+                self.session.rollback()
+                item.status = BatchItemStatus.FAILED
+                item.message = f"升级异常：{e}"
+                result.items.append(item)
+                result.failed_count += 1
+                continue
+
+            if res.success:
+                item.status = BatchItemStatus.SUCCESS
+                result.success_count += 1
+            else:
+                # 失败原因甄别：执行后游戏行版本已与仓库一致 → 同版本跳过
+                # （扫描后游戏侧已被更新等场景），比匹配 message 子串稳健
+                game_now = (
+                    self.get_game_mod_by_guid(item.guid)
+                    if repo_mod is not None and item.guid
+                    else None
+                )
+                if game_now is not None and game_now.version == repo_mod.version:
+                    item.status = BatchItemStatus.SKIPPED
+                    result.skipped_count += 1
+                else:
+                    item.status = BatchItemStatus.FAILED
+                    result.failed_count += 1
+            item.message = res.message
+            result.items.append(item)
+
+        if progress_callback:
+            progress_callback(total, total, "完成")
+        logger.info(
+            "批量升级完成: 总={} 成功={} 跳过={} 失败={}",
+            result.total, result.success_count, result.skipped_count, result.failed_count,
+        )
+        return result
 
     # ═══════════════════════════════════════════════════════════
     # 查询

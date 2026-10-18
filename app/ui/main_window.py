@@ -35,6 +35,7 @@ from app.ui.card_result_dialog import CardResultDialog
 from app.ui.card_parse_page import CardParsePage
 from app.ui.batch_install_dialog import BatchInstallDialog
 from app.ui.sync_dialog import SyncDialog
+from app.ui.version_scan_dialog import VersionScanDialog
 from app.ui.card_parse_worker import CardParseWorker
 from app.utils.version_utils import display_version
 
@@ -213,6 +214,7 @@ class MainWindow(QMainWindow):
         # 🔄 数据
         data_btn = make_menu_btn("🔄 数据 ▾", "数据库与磁盘的同步 / 重建")
         data_btn.menu().addAction("⟳ 同步磁盘（保留备注）", self._sync_mods)
+        data_btn.menu().addAction("🔍 仓库版本巡检", self._version_scan)
         data_btn.menu().addSeparator()
         data_btn.menu().addAction("⚠ 初始化MOD（清空重建）", self._init_mod)
         toolbar.addWidget(data_btn)
@@ -1136,6 +1138,27 @@ class MainWindow(QMainWindow):
         """同步完成后刷新两个位置的列表"""
         # worker 用独立 session 提交，主窗口 session 的 identity map
         # 里可能还是旧对象，必须先过期再重查
+        self._mod_service.session.expire_all()
+        self._refresh_game_list()
+        self._refresh_repo_list()
+
+    def _version_scan(self):
+        """仓库版本巡检 / 一键升级（F24，后台线程）"""
+        config = get_config()
+        if not config.game_mod_path or not config.repo_path:
+            # 扫描读两侧、升级从仓库复制到游戏，两条路径缺一不可
+            QMessageBox.warning(
+                self,
+                "提示",
+                "仓库版本巡检需要同时配置游戏 Mod 路径和本地仓库路径，请先在设置中配置",
+            )
+            return
+        dialog = VersionScanDialog(self)
+        dialog.upgrade_finished.connect(self._on_version_upgrade_finished)
+        dialog.exec()
+
+    def _on_version_upgrade_finished(self):
+        """F24 worker 用独立 session 提交，需过期后重查（同 _on_sync_finished）"""
         self._mod_service.session.expire_all()
         self._refresh_game_list()
         self._refresh_repo_list()

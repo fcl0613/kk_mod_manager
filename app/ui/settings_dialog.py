@@ -1,10 +1,10 @@
-"""设置对话框（F01 / F16 / F19 / F23 / F25）
+"""设置对话框（F01 / F16 / F19 / F23）
 
 需求文档 v1.5:
   - 游戏 Mod 路径配置（F01）
   - 本地仓库路径配置（F01）
   - 远程仓库 URL 配置（F16，P2，可选）
-  - 行为配置：卸载前确认、清理空目录、应用内回收站开关（F25）
+  - 行为配置：卸载前确认、清理空目录
   - 分类目录配置（F19）：安装开关、分类清单、角色类/工作室类落点
   - Sideloader 日志路径（F23）：BepInEx LogOutput.log，留空自动探测
   - 主题选择
@@ -12,17 +12,12 @@
 
 from pathlib import Path
 
-from PyQt6.QtCore import QUrl
-from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton, QCheckBox, QComboBox,
-    QGroupBox, QFormLayout, QFileDialog, QPlainTextEdit, QLabel, QWidget, QMessageBox
+    QGroupBox, QFormLayout, QFileDialog, QPlainTextEdit, QLabel, QWidget
 )
 
 from app.config import describe_category, get_config, save_config
-from app.utils.file_utils import (
-    empty_trash, ensure_dir, fmt_size, get_trash_dir, trash_stats
-)
 
 
 class SettingsDialog(QDialog):
@@ -138,26 +133,6 @@ class SettingsDialog(QDialog):
         self.clean_empty_cb.setChecked(True)
         behavior_layout.addWidget(self.clean_empty_cb)
 
-        # 应用内回收站（F25）：开关 + 统计 + 打开 / 清空
-        self.use_trash_cb = QCheckBox(
-            "删除操作移入应用内回收站 data/.trash/（关闭则硬删除，F25）"
-        )
-        self.use_trash_cb.setChecked(True)
-        behavior_layout.addWidget(self.use_trash_cb)
-
-        trash_row = QHBoxLayout()
-        self.trash_stats_label = QLabel()
-        self.open_trash_btn = QPushButton("📂 打开回收站目录")
-        self.open_trash_btn.clicked.connect(self._open_trash)
-        self.empty_trash_btn = QPushButton("🗑 清空回收站")
-        self.empty_trash_btn.setObjectName("danger")
-        self.empty_trash_btn.clicked.connect(self._empty_trash)
-        trash_row.addWidget(self.trash_stats_label)
-        trash_row.addStretch(1)
-        trash_row.addWidget(self.open_trash_btn)
-        trash_row.addWidget(self.empty_trash_btn)
-        behavior_layout.addLayout(trash_row)
-
         layout.addWidget(behavior_group)
 
         # ── 界面主题 ──
@@ -246,8 +221,6 @@ class SettingsDialog(QDialog):
         self.remote_url_edit.setText(cfg.remote_repo_url)
         self.confirm_uninstall_cb.setChecked(cfg.confirm_before_uninstall)
         self.clean_empty_cb.setChecked(cfg.clean_empty_dirs)
-        self.use_trash_cb.setChecked(cfg.use_trash)
-        self._refresh_trash_stats()
 
         # 分类目录（F19）：清单载入为多行文本，落点下拉候选项来自清单
         cat = cfg.category
@@ -285,42 +258,6 @@ class SettingsDialog(QDialog):
         if path:
             self.sidelog_path_edit.setText(path)
 
-    # ── 应用内回收站（F25）──────────────────────────────────
-
-    def _refresh_trash_stats(self):
-        """刷新回收站统计行（文件数 / 占用空间）"""
-        count, size = trash_stats()
-        self.trash_stats_label.setText(f"回收站：{count} 个文件 · {fmt_size(size)}")
-
-    def _open_trash(self):
-        """在系统资源管理器中打开回收站目录（不存在则先创建）"""
-        ensure_dir(get_trash_dir())
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(get_trash_dir())))
-
-    def _empty_trash(self):
-        """清空回收站（二次确认后硬删全部内容，F25-3）"""
-        count, size = trash_stats()
-        if count == 0:
-            QMessageBox.information(self, "回收站", "回收站是空的。")
-            return
-        answer = QMessageBox.question(
-            self,
-            "清空回收站",
-            f"将永久删除回收站中的 {count} 个文件（{fmt_size(size)}）。\n"
-            "此操作不可恢复，确认清空？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        try:
-            removed = empty_trash()
-        except OSError as e:
-            QMessageBox.critical(self, "清空失败", f"清空回收站失败：{e}")
-            return
-        QMessageBox.information(self, "回收站", f"已清空回收站，共删除 {removed} 个文件。")
-        self._refresh_trash_stats()
-
     def _save(self):
         """保存配置"""
         # 基本校验
@@ -344,7 +281,6 @@ class SettingsDialog(QDialog):
         self._config.remote_repo_url = remote_url
         self._config.confirm_before_uninstall = self.confirm_uninstall_cb.isChecked()
         self._config.clean_empty_dirs = self.clean_empty_cb.isChecked()
-        self._config.use_trash = self.use_trash_cb.isChecked()
         self._config.theme = self.theme_combo.currentData()
 
         # 分类目录（F19）：清单多行文本以分号拼回；落点为空回退默认

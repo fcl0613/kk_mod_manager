@@ -2,14 +2,12 @@
 
 实现需求文档 BR-F01~F06 文件操作规则：
   - BR-F01: .zipmod 就是 Mod，安装 = 复制，不解压
-  - BR-F02: 卸载/移除 = 删除 .zipmod（或 .zipmod_disabled，F25 起默认移入回收站）
+  - BR-F02: 卸载/移除 = 删除 .zipmod（或 .zipmod_disabled）
   - BR-F03: 禁用 = 改扩展名，不移动
   - BR-F05: 同名文件重命名规则
   - BR-F06: 冲突时追加序号
-  - F25: 应用内回收站 data/.trash/（按日期分目录、同名加序号、手动清空）
 """
 
-from datetime import datetime
 from pathlib import Path, PurePosixPath
 import shutil
 import os
@@ -101,96 +99,6 @@ def delete_file(path: Path) -> bool:
     except OSError:
         pass
     return False
-
-
-# ── 应用内回收站（F25）────────────────────────────────────────
-
-def get_trash_dir() -> Path:
-    """回收站根目录 data/.trash/（应用数据目录下，与 mods.db 同级）"""
-    # 局部导入：保持 utils 模块无 app 层模块级耦合
-    from app.database import get_data_dir
-    return get_data_dir() / ".trash"
-
-
-def move_to_trash(path: Path) -> Path:
-    """将文件移入应用内回收站（F25-1/2），返回回收站内的新路径。
-
-    - 按删除日期分目录：data/.trash/YYYY-MM-DD/原文件名
-    - 同名冲突追加 _序号（对齐 safe_copy 的 BR-F06 风格）
-    - 同盘为 rename（秒级、不引入依赖），跨盘由 shutil.move 回退拷贝
-
-    Raises:
-        OSError: 文件不存在或移动失败（被占用等）——调用方须将整个
-            删除操作报告为失败，不得静默丢文件（F25-5）。
-    """
-    if not path.exists():
-        raise FileNotFoundError(f"文件不存在：{path}")
-
-    day_dir = get_trash_dir() / datetime.now().strftime("%Y-%m-%d")
-    ensure_dir(day_dir)
-
-    name = path.name
-    stem, suffix = name, ""
-    if name.lower().endswith(".zipmod_disabled"):
-        stem, suffix = name[:-16], ".zipmod_disabled"
-    elif name.lower().endswith(".zipmod"):
-        stem, suffix = name[:-7], ".zipmod"
-
-    dest = day_dir / name
-    counter = 1
-    while dest.exists():
-        dest = day_dir / f"{stem}_{counter}{suffix}"
-        counter += 1
-
-    shutil.move(str(path), str(dest))
-    return dest
-
-
-def trash_stats() -> tuple[int, int]:
-    """回收站统计 (文件数, 总字节数)；目录不存在返回 (0, 0)"""
-    root = get_trash_dir()
-    if not root.exists():
-        return (0, 0)
-    count = 0
-    total = 0
-    for f in root.rglob("*"):
-        if not f.is_file():
-            continue
-        try:
-            total += f.stat().st_size
-        except OSError:
-            continue  # 统计中途被并发清掉的非关键路径
-        count += 1
-    return (count, total)
-
-
-def empty_trash() -> int:
-    """清空回收站（硬删全部内容，F25-3），返回清除的文件数。
-
-    Raises:
-        OSError: 删除失败（文件被占用等）——已删部分不回滚。
-    """
-    root = get_trash_dir()
-    if not root.exists():
-        return 0
-    count = sum(1 for f in root.rglob("*") if f.is_file())
-    for entry in sorted(root.iterdir()):
-        if entry.is_dir():
-            shutil.rmtree(entry)
-        else:
-            entry.unlink()
-    return count
-
-
-def fmt_size(size: int) -> str:
-    """字节数 → 人类可读（对齐文件管理器口径）"""
-    if size >= 1024 * 1024 * 1024:
-        return f"{size / 1024 / 1024 / 1024:.1f} GB"
-    if size >= 1024 * 1024:
-        return f"{size / 1024 / 1024:.1f} MB"
-    if size >= 1024:
-        return f"{size / 1024:.1f} KB"
-    return f"{size} B"
 
 
 def rename_extension(path: Path, old_suffix: str, new_suffix: str) -> Path | None:

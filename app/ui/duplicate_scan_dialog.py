@@ -4,8 +4,7 @@
 的多个文件（判重以磁盘为准，不查库——DB 唯一索引会漏报同位置多文件）：
   - 按 GUID 分组列出文件 / 版本 / 大小 / 修改时间 / 禁用态 / MD5 相同标注
   - 默认预勾选「保留最新版」的建议删除项（F22-4），用户确认后才执行
-  - 默认移入应用内回收站 data/.trash/（F25，开关关闭时硬删），删除后
-    自动增量同步数据库对账
+  - 首期硬删除（F22-5），删除后自动增量同步数据库对账
 
 后台 QThread 执行（复刻 VersionScanDialog 的 worker 模式），
 worker 线程内自建 session，不与主窗口共享。
@@ -29,7 +28,6 @@ from PyQt6.QtWidgets import (
     QHeaderView,
 )
 
-from app.config import get_config
 from app.database import get_session
 from app.services.mod_service import (
     BatchItemStatus,
@@ -39,7 +37,6 @@ from app.services.mod_service import (
     DuplicateScanReport,
     ModService,
 )
-from app.utils.file_utils import fmt_size
 from app.utils.version_utils import display_version
 
 # 标注列前景色（对齐 version_scan_dialog 的语义色）
@@ -47,6 +44,17 @@ _GREEN = QColor("#a6e3a1")     # 建议保留 / 已删除
 _YELLOW = QColor("#f9e2af")    # MD5 相同副本 / 禁用
 _GRAY = QColor("#a6adc8")      # 跳过
 _RED = QColor("#f38ba8")       # 失败
+
+
+def _fmt_size(size: int) -> str:
+    """字节数 → 人类可读（对齐文件管理器口径）"""
+    if size >= 1024 * 1024 * 1024:
+        return f"{size / 1024 / 1024 / 1024:.1f} GB"
+    if size >= 1024 * 1024:
+        return f"{size / 1024 / 1024:.1f} MB"
+    if size >= 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size} B"
 
 
 # ═══════════════════════════════════════════════════════════
@@ -265,7 +273,7 @@ class DuplicateScanDialog(QDialog):
                     "",
                     entry.relative_path,
                     display_version(entry.version),
-                    fmt_size(entry.size),
+                    _fmt_size(entry.size),
                     mtime_text,
                     self._entry_badge(entry),
                 ])
@@ -316,7 +324,7 @@ class DuplicateScanDialog(QDialog):
         ]
         size = sum(e.size for e in checked)
         self._checked_label.setText(
-            f"已选 {len(checked)} / {len(entries)} 项 · 约 {fmt_size(size)}"
+            f"已选 {len(checked)} / {len(entries)} 项 · 约 {_fmt_size(size)}"
         )
         self._delete_btn.setEnabled(len(checked) > 0 and not self._running)
 
@@ -378,20 +386,11 @@ class DuplicateScanDialog(QDialog):
                 f"这些 Mod 将被彻底移除！"
             )
 
-        if get_config().use_trash:
-            delete_note = (
-                "  • 文件将移入应用内回收站 data/.trash/（可在设置页打开目录或清空）\n"
-            )
-        else:
-            delete_note = (
-                "  • 回收站已在设置中关闭：硬删除，文件不会进入回收站，删除后无法恢复\n"
-            )
-
         answer = QMessageBox.question(
             self,
             "确认删除重复文件",
-            f"将删除选中的 {len(checked)} 个文件（约 {fmt_size(size)}）：\n\n"
-            f"{delete_note}"
+            f"将永久删除选中的 {len(checked)} 个文件（约 {_fmt_size(size)}）：\n\n"
+            "  • 首期为硬删除，文件不会进入回收站，删除后无法恢复\n"
             "  • 删除完成后将自动同步数据库，把记录对准磁盘幸存文件\n"
             f"{warning}\n确认继续删除？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -443,9 +442,8 @@ class DuplicateScanDialog(QDialog):
             )
         self._status_label.setText(status_text)
 
-        success_text = "✅ 已移入回收站" if get_config().use_trash else "✅ 已删除"
         status_styles = {
-            BatchItemStatus.SUCCESS: (success_text, _GREEN),
+            BatchItemStatus.SUCCESS: ("✅ 已删除", _GREEN),
             BatchItemStatus.SKIPPED: ("⏭ 已跳过", _GRAY),
             BatchItemStatus.FAILED: ("❌ 失败", _RED),
         }

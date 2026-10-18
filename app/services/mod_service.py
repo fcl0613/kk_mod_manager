@@ -37,7 +37,6 @@ from app.services.manifest_service import (
 from app.utils.file_utils import (
     safe_copy,
     delete_file,
-    move_to_trash,
     rename_extension,
     clean_empty_dirs,
     get_author_dir,
@@ -703,24 +702,15 @@ class ModService:
             base_path = config.repo_path
             file_path = resolve_repo_mod_path(mod, Path(base_path))
 
-        # 删除文件（F25-1：默认移入应用内回收站；移入失败整个操作
-        # 报失败、文件与 DB 行都保留，不静默丢文件 F25-5）
-        trashed = False
         if file_path.exists():
             try:
-                if config.use_trash:
-                    trash_path = move_to_trash(file_path)
-                    trashed = True
-                    logger.info("移入回收站: {} → {}", file_path, trash_path)
-                else:
-                    delete_file(file_path)
-                    logger.info("删除文件: {}", file_path)
+                delete_file(file_path)
+                logger.info("删除文件: {}", file_path)
             except OSError as e:
-                action = "移入回收站" if config.use_trash else "删除文件"
-                logger.error("{}失败: {} - {}", action, file_path, e)
+                logger.error("删除文件失败: {} - {}", file_path, e)
                 return InstallResult(
                     success=False,
-                    message=f"{action}失败：{e}",
+                    message=f"删除文件失败：{e}",
                 )
 
         # 清理空目录（GAME 端排除分类目录：分类目录即使被清空也不删除，BR-CAT06）
@@ -741,7 +731,7 @@ class ModService:
             mod_name=mod.name,
             mod_guid=mod.guid,
             location=mod.location.value,
-            detail=f"删除 {mod.file_name}" + ("（→ 回收站）" if trashed else ""),
+            detail=f"删除 {mod.file_name}",
         )
 
         self.session.delete(mod)
@@ -1390,14 +1380,12 @@ class ModService:
         entries: list[DuplicateFileEntry],
         progress_callback: Callable[[int, int, str], None] | None = None,
     ) -> DuplicateCleanupResult:
-        """删除选中的重复文件并对账数据库（F22-5：用户确认后才调用）。
+        """删除选中的重复文件并对账数据库（F22-5：用户确认后才调用，首期硬删除）。
 
-        F25 起默认移入应用内回收站（开关关闭时回退硬删，F25-4 取代
-        F22-5 首期硬删除条款）；删除后对每个发生实际删除的位置跑一次
-        增量磁盘同步（sync_from_disk）把 DB 行重新对准磁盘幸存文件——
-        判重以磁盘为准，被删的可能正是 DB 跟踪的文件。单项失败不中断
-        批量；对账失败不影响已完成的删除，错误记入 sync_errors 提示
-        用户手动「同步磁盘」。
+        删除后对每个发生实际删除的位置跑一次增量磁盘同步（sync_from_disk）
+        把 DB 行重新对准磁盘幸存文件——判重以磁盘为准，被删的可能正是
+        DB 跟踪的文件。单项失败不中断批量；对账失败不影响已完成的删除，
+        错误记入 sync_errors 提示用户手动「同步磁盘」。
 
         Args:
             entries: 待删除的文件（通常来自 DuplicateScanReport 的勾选项）
@@ -1409,7 +1397,6 @@ class ModService:
         """
         result = DuplicateCleanupResult(total=len(entries))
         config = get_config()
-        use_trash = config.use_trash
         deleted_by_location: dict[ModLocation, list[CleanupItemResult]] = {}
 
         for idx, entry in enumerate(entries):
@@ -1421,28 +1408,19 @@ class ModService:
                 item.message = "文件已不存在（可能已被手动删除）"
                 result.skipped_count += 1
             else:
-                # F25-1：默认移入回收站；失败按 FAILED 上报（F25-5）
                 try:
-                    if use_trash:
-                        move_to_trash(entry.path)
-                    else:
-                        entry.path.unlink()
+                    entry.path.unlink()
                 except OSError as e:
-                    action = "移入回收站" if use_trash else "删除"
                     item.status = BatchItemStatus.FAILED
-                    item.message = f"{action}失败：{e}"
+                    item.message = f"删除失败：{e}"
                     result.failed_count += 1
-                    logger.error("重复项清理 - {}失败: {} - {}", action, entry.path, e)
+                    logger.error("重复项清理 - 删除失败: {} - {}", entry.path, e)
                 else:
                     item.status = BatchItemStatus.SUCCESS
-                    item.message = (
-                        f"已移入回收站 {entry.relative_path}" if use_trash
-                        else f"已删除 {entry.relative_path}"
-                    )
+                    item.message = f"已删除 {entry.relative_path}"
                     result.success_count += 1
                     deleted_by_location.setdefault(entry.location, []).append(item)
-                    logger.info("重复项清理 - {}: {} (GUID={})",
-                                "移入回收站" if use_trash else "删除", entry.path, entry.guid)
+                    logger.info("重复项清理 - 删除: {} (GUID={})", entry.path, entry.guid)
             result.items.append(item)
 
         if progress_callback:
@@ -1470,13 +1448,12 @@ class ModService:
             if not deleted:
                 continue
             names = "、".join(i.entry.path.name for i in deleted)[:300]
-            action = "移入回收站" if use_trash else "硬删除"
             self._log_operation(
                 operation="dedup",
                 mod_name="(重复项清理)",
                 mod_guid="",
                 location=location.value,
-                detail=f"{action} {len(deleted)} 个重复文件：{names}",
+                detail=f"硬删除 {len(deleted)} 个重复文件：{names}",
             )
             self.session.commit()
 
@@ -2373,26 +2350,13 @@ class ModService:
 
     @staticmethod
     def _remove_mod_files(mod: Mod, base_path: str) -> None:
-        """删除 Mod 对应的磁盘文件（rel path 优先定位，F19-6）。
-
-        F25-1：默认移入回收站（升级换代的旧版本可找回）；此路径是
-        新版本文件已就位后的附带清理，失败时仅告警并把文件留在原地
-        （沿用原 delete_file 吞错的宽松口径，残留可由 F22 重复项
-        检查收尾），不适用 F25-5 的「整个操作报失败」。
-        """
+        """删除 Mod 对应的磁盘文件（rel path 优先定位，F19-6）"""
         base = Path(base_path)
         if mod.location == ModLocation.REPO:
             file_path = resolve_repo_mod_path(mod, base)
         else:
             file_path = resolve_game_mod_path(mod, base)
-        if not file_path.exists():
-            return
-        if get_config().use_trash:
-            try:
-                move_to_trash(file_path)
-            except OSError as e:
-                logger.warning("旧版本移入回收站失败，文件保留原地: {} - {}", file_path, e)
-        else:
+        if file_path.exists():
             delete_file(file_path)
 
     def _log_operation(

@@ -2,17 +2,77 @@
 
 配置存储在 exe 所在目录的 data/config.json（需求文档 8.3）。
 
-需求文档 v1.3 配置项：
+需求文档 v1.5 配置项：
   - game_mod_path: 游戏 Mod 路径
   - repo_path: 本地 Mod 仓库路径
   - remote_repo_url: 远程仓库 URL（可选）
   - UI 主题: 暗色/亮色
   - 行为配置: 卸载前确认、清理空目录
+  - 分类目录（F19）: 安装开关、分类清单、角色类/工作室类落点
+  - Sideloader 日志路径（F23）: BepInEx LogOutput.log，自动探测失败时由用户指定
 """
 
 from pathlib import Path
 import json
 from pydantic import BaseModel, Field
+
+# F19-2 默认分类目录清单（分号分隔，社区主流布局）
+DEFAULT_GAME_CATEGORIES = (
+    "AdditionalPoses;BasisAndShaders;ForCharactersLoading;"
+    "ForStudioScenesLoading;KK_-ExclusivesAndUncensors;KK_-ExtraMaps;MyMods"
+)
+
+# 常见 Sideloader 分类目录的中文说明（仅展示层注记：
+# 目录创建/匹配/落盘一律用原始名，此表不参与任何逻辑判断）
+CATEGORY_DESCRIPTIONS = {
+    "AdditionalPoses": "追加姿势",
+    "BasisAndShaders": "基础与着色器",
+    "ForCharactersLoading": "角色加载用",
+    "ForStudioScenesLoading": "工作室场景加载用",
+    "KK_-ExclusivesAndUncensors": "KK 专属与去码",
+    "KK_-ExtraMaps": "KK 额外地图",
+    "MyMods": "我的 Mod",
+}
+
+
+def describe_category(name: str) -> str:
+    """分类目录名 → 追加中文说明的展示文本；未知/自定义分类原样返回"""
+    stripped = name.strip()
+    desc = CATEGORY_DESCRIPTIONS.get(stripped)
+    return f"{stripped}（{desc}）" if desc else name
+
+
+class CategoryConfig(BaseModel):
+    """游戏分类目录安装配置（F19，需求文档 7.3）"""
+
+    game_category_enabled: bool = Field(
+        default=True,
+        description="分类目录安装开关：开启时安装到 {游戏Mod路径}/{分类}/{作者}/",
+    )
+    game_categories: str = Field(
+        default=DEFAULT_GAME_CATEGORIES,
+        description="分类目录名清单（分号分隔）",
+    )
+    category_chara: str = Field(
+        default="ForCharactersLoading",
+        description="角色类依赖的安装目标分类（人物/服装卡及场景卡【角色】）",
+    )
+    category_studio: str = Field(
+        default="ForStudioScenesLoading",
+        description="工作室类依赖的安装目标分类（场景卡【工作室】）",
+    )
+
+    @property
+    def category_names(self) -> list[str]:
+        """分类目录名列表（去空、保序去重）"""
+        seen: set[str] = set()
+        result: list[str] = []
+        for name in self.game_categories.split(";"):
+            name = name.strip()
+            if name and name not in seen:
+                seen.add(name)
+                result.append(name)
+        return result
 
 
 class AppConfig(BaseModel):
@@ -26,6 +86,13 @@ class AppConfig(BaseModel):
     repo_path: str = Field(
         default="",
         description="本地 Mod 仓库路径（Mod 收藏目录）"
+    )
+
+    # ── Sideloader 日志（F23）──
+    sideloader_log_path: str = Field(
+        default="",
+        description="BepInEx LogOutput.log 路径（从游戏日志读取缺失；"
+                    "自动探测失败时由用户指定一次，设置页可改，留空回到自动探测）",
     )
 
     # ── 远程仓库（P2）──
@@ -75,6 +142,9 @@ class AppConfig(BaseModel):
     update_latest_is_prerelease: bool = Field(
         default=False, description="最近记录的最新版本是否为预览版"
     )
+
+    # ── 分类目录（F19）──
+    category: CategoryConfig = Field(default_factory=CategoryConfig)
 
     # ── 版本 ──
     config_version: str = Field(default="2", description="配置文件版本号")

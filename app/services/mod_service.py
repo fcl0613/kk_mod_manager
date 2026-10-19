@@ -1,25 +1,29 @@
-"""Mod 核心业务服务（F04 / F06 / F08 / F14）
+"""Mod 核心业务服务（F04 / F06 / F08 / F14 / F19）
 
-需求文档 v1.3:
-  - F04: Mod 安装到游戏（复制 zipmod 到 {游戏路径}/{作者}/）
-  - F14: Mod 添加到仓库（复制 zipmod 到 {仓库路径}/{作者}/）
+需求文档 v1.5:
+  - F04: Mod 安装到游戏（复制 zipmod，F19 分类布局 {游戏路径}/{分类}/{作者}/）
+  - F14: Mod 添加到仓库（复制 zipmod 到 {仓库路径}/{作者}/，不分类）
   - F06: 卸载/移除（删除 zipmod 文件）
   - F08: 启用/禁用（修改文件扩展名）
+  - F19: 分类目录安装（卡片视角路由，category 由调用方给出，不来自 zip 内容）
 
 核心设计：
   - 安装 = 复制 .zipmod 到目标目录（不解压！）
-  - 按作者名分类创建目录
+  - GAME 端按分类+作者建目录并持久化 game_relative_path；REPO 端维持单层作者目录
   - 双重检测（游戏+仓库）防止重复
 """
 
+import hashlib
+import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Callable
 
 from sqlalchemy.orm import Session
 from loguru import logger
+from packaging.version import InvalidVersion, Version
 
 from app.config import get_config
 from app.models.mod import Mod, ModLocation, ModStatus, OperationLog
@@ -36,9 +40,17 @@ from app.utils.file_utils import (
     rename_extension,
     clean_empty_dirs,
     get_author_dir,
+    compute_relative_path,
     compute_repo_relative_path,
     resolve_repo_mod_path,
+    resolve_game_mod_path,
+    infer_author_from_path,
+    derive_category_from_relpath,
 )
+from app.utils.version_utils import display_version
+
+# F10-4 日志保留期限（暂定值，后续可开放为设置项）
+LOG_RETENTION_DAYS = 30
 
 
 @dataclass
@@ -95,6 +107,235 @@ class BatchInstallResult:
         return [i for i in self.items if i.status == BatchItemStatus.FAILED]
 
 
+# ═══════════════════════════════════════════════════════════
+# 磁盘同步相关数据类（Sync）
+# ═══════════════════════════════════════════════════════════
+
+
+@dataclass
+class SyncChangeItem:
+    """磁盘同步单项变更明细"""
+    action: str            # "added" / "removed" / "updated" / "parse_failed"
+    guid: str
+    name: str
+    file_name: str
+    detail: str = ""       # 如 "v1.0.0 → v2.0.0"、"文件已消失"、"状态: 启用→禁用"
+
+
+@dataclass
+class SyncReport:
+    """单位置磁盘同步报告"""
+    location: ModLocation = ModLocation.GAME
+    scanned: int = 0                       # 磁盘扫描到的 zipmod 文件数（含禁用）
+    db_before: int = 0                     # 同步前该位置 DB 记录数
+    added: list[SyncChangeItem] = field(default_factory=list)
+    removed: list[SyncChangeItem] = field(default_factory=list)
+    updated: list[SyncChangeItem] = field(default_factory=list)
+    parse_failures: list[SyncChangeItem] = field(default_factory=list)
+    skipped: bool = False                  # 路径未配置 / 目录不存在
+    message: str = ""                      # skipped 原因
+
+    @property
+    def change_count(self) -> int:
+        """新增 + 删除 + 更新总数"""
+        return len(self.added) + len(self.removed) + len(self.updated)
+
+    def summary(self) -> str:
+        """一行中文摘要（供 UI / 操作日志使用）"""
+        if self.skipped:
+            return f"[{self.location.value}] 跳过：{self.message}"
+        label = "游戏" if self.location == ModLocation.GAME else "仓库"
+        return (
+            f"[{label}] 扫描 {self.scanned} | 新增 {len(self.added)} | "
+            f"删除 {len(self.removed)} | 更新 {len(self.updated)} | "
+            f"解析失败 {len(self.parse_failures)}"
+        )
+
+
+# ═══════════════════════════════════════════════════════════
+# 仓库版本巡检相关数据类（F24）
+# ═══════════════════════════════════════════════════════════
+
+
+@dataclass
+class VersionDiffItem:
+    """F24 巡检单项：GAME 与 REPO 同 GUID 的版本差异"""
+    guid: str
+    name: str                  # 展示名（GAME/REPO 同名）
+    author: str
+    game_version: str          # 原始字符串（展示层走 display_version）
+    repo_version: str
+    game_mod_id: int           # GAME 行 ID（参考）
+    repo_mod_id: int           # REPO 行 ID（升级目标）
+    category: str | None = None  # 由 game_relative_path 首段推导的 F19 分类；None=平铺布局
+
+
+@dataclass
+class VersionScanReport:
+    """仓库版本巡检报告（F24-1）"""
+    repo_newer: list[VersionDiffItem] = field(default_factory=list)   # 仓库更新（可升级）
+    game_newer: list[VersionDiffItem] = field(default_factory=list)   # 游戏更新（仅参考，F24-3）
+    scanned_game: int = 0
+    scanned_repo: int = 0
+    skipped_unparseable: int = 0    # BR-V03 排除（任一侧不可解析）的配对数
+
+    def summary(self) -> str:
+        """一行中文摘要（供 UI / 操作日志使用，对齐 SyncReport.summary）"""
+        return (
+            f"仓库版本巡检：对比 GAME {self.scanned_game} 行 / REPO {self.scanned_repo} 行 | "
+            f"仓库更新 {len(self.repo_newer)} 项 | 游戏更新 {len(self.game_newer)} 项 | "
+            f"版本不可比 {self.skipped_unparseable} 对（已忽略）"
+        )
+
+
+@dataclass
+class UpgradeItemResult:
+    """F24 批量升级单项结果"""
+    guid: str
+    name: str
+    game_version: str          # 升级前的游戏版本（原始字符串）
+    repo_version: str
+    status: BatchItemStatus = BatchItemStatus.PENDING   # 复用批量安装状态枚举
+    message: str = ""
+
+
+@dataclass
+class BatchUpgradeResult:
+    """F24 批量升级总结果"""
+    total: int = 0
+    success_count: int = 0
+    skipped_count: int = 0
+    failed_count: int = 0
+    items: list[UpgradeItemResult] = field(default_factory=list)
+
+
+# ═══════════════════════════════════════════════════════════
+# 重复项检查 / 清理相关数据类（F22）
+# ═══════════════════════════════════════════════════════════
+
+
+@dataclass
+class DuplicateFileEntry:
+    """F22 重复组内的单个磁盘文件（判重以磁盘扫描 + manifest 解析为准）"""
+    path: Path                        # 磁盘绝对路径
+    location: ModLocation             # GAME / REPO（组内同位置，F22-2）
+    guid: str
+    name: str                         # manifest 名称
+    version: str                      # 原始版本串（展示层走 display_version）
+    author: str
+    size: int                         # 字节数
+    mtime: float                      # 修改时间戳
+    is_disabled: bool                 # .zipmod_disabled（计入并标注，F22-2）
+    relative_path: str                # 相对位置根目录（展示 / 提示用）
+    md5: str = ""                     # 组内补算（F22-3），读取失败为 ""
+    has_identical_twin: bool = False  # 组内存在 MD5 相同的其他文件（字节级副本）
+    suggested_keep: bool = False      # 「保留最新版」建议（F22-4）
+
+
+@dataclass
+class DuplicateGroup:
+    """F22 同位置内同 GUID 的重复文件组"""
+    guid: str
+    name: str                   # 展示名（取保留建议项的 manifest 名）
+    author: str
+    location: ModLocation
+    files: list[DuplicateFileEntry]  # 展示序：建议保留项居首，其余按修改时间降序
+
+    @property
+    def suggested_delete_files(self) -> list[DuplicateFileEntry]:
+        """建议删除的文件（除保留项外全部，F22-4 默认预勾选项）"""
+        return [f for f in self.files if not f.suggested_keep]
+
+
+@dataclass
+class DuplicateParseFailure:
+    """F22 扫描中解析失败的文件（不参与判重，仅提示）"""
+    path: Path
+    location: ModLocation
+    reason: str
+
+
+@dataclass
+class DuplicateScanReport:
+    """重复项检查报告（F22-1）"""
+    groups: list[DuplicateGroup] = field(default_factory=list)
+    scanned_game: int = 0
+    scanned_repo: int = 0
+    skipped_game: str = ""       # 非空 = 游戏侧跳过原因（未配置 / 目录不存在）
+    skipped_repo: str = ""
+    parse_failures: list[DuplicateParseFailure] = field(default_factory=list)
+
+    @property
+    def duplicate_file_count(self) -> int:
+        """重复组内的文件总数"""
+        return sum(len(g.files) for g in self.groups)
+
+    @property
+    def suggested_delete_count(self) -> int:
+        """建议删除的文件数"""
+        return sum(len(g.suggested_delete_files) for g in self.groups)
+
+    @property
+    def suggested_delete_size(self) -> int:
+        """建议删除项合计字节数（可释放空间）"""
+        return sum(f.size for g in self.groups for f in g.suggested_delete_files)
+
+    def summary(self) -> str:
+        """一行中文摘要（供 UI / 操作日志使用，对齐 VersionScanReport.summary）"""
+        lines = []
+        if self.skipped_game:
+            lines.append(f"[游戏] 跳过：{self.skipped_game}")
+        if self.skipped_repo:
+            lines.append(f"[仓库] 跳过：{self.skipped_repo}")
+        lines.append(
+            f"重复项检查：扫描游戏 {self.scanned_game} / 仓库 {self.scanned_repo} 个文件 | "
+            f"重复 GUID {len(self.groups)} 组（{self.duplicate_file_count} 个文件）| "
+            f"建议删除 {self.suggested_delete_count} 项"
+        )
+        if self.parse_failures:
+            lines.append(f"另有 {len(self.parse_failures)} 个文件解析失败（不参与判重）")
+        return "\n".join(lines)
+
+
+@dataclass
+class CleanupItemResult:
+    """F22 清理单项结果"""
+    entry: DuplicateFileEntry
+    status: BatchItemStatus = BatchItemStatus.PENDING   # 复用批量安装状态枚举
+    message: str = ""
+
+
+@dataclass
+class DuplicateCleanupResult:
+    """F22 批量清理总结果"""
+    total: int = 0
+    success_count: int = 0
+    skipped_count: int = 0
+    failed_count: int = 0
+    items: list[CleanupItemResult] = field(default_factory=list)
+    sync_reports: list[SyncReport] = field(default_factory=list)  # 删除后对账报告
+    sync_errors: list[str] = field(default_factory=list)          # 对账失败的异常信息
+
+    def summary(self) -> str:
+        """一行中文摘要"""
+        text = (
+            f"重复项清理：删除 {self.success_count} · 跳过 {self.skipped_count} · "
+            f"失败 {self.failed_count}"
+        )
+        if self.sync_reports:
+            text += " | " + "；".join(r.summary() for r in self.sync_reports)
+        return text
+
+
+def _normalize_author(author: str | None) -> str:
+    """落库作者名：空值统一为 "Unknown"。
+
+    与列表分组（group_by_author）、目录规则（get_author_dir）的展示一致，
+    保证搜索 "Unknown" 能命中（空串不会 LIKE 匹配）。
+    """
+    return (author or "").strip() or "Unknown"
+
+
 class ModService:
     """Mod 核心业务服务"""
 
@@ -103,14 +344,29 @@ class ModService:
         self.manifest_svc = ManifestService()
 
     # ═══════════════════════════════════════════════════════════
-    # 安装到游戏（F04）
+    # 安装到游戏（F04 / F19）
     # ═══════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _game_target_dir(game_root: Path, category: str | None, author: str) -> Path:
+        """计算 GAME 端安装目标目录（F19，开发文档 _game_target_dir）。
+
+        分类开关开启且调用方给出 category → {分类}/{作者}/ 三段式
+        （两级目录都复用大小写不敏感匹配，BR-CAT01）；
+        否则（category 为空或开关关闭）→ {作者}/ 旧公式（F19-5）。
+        category 只能来自调用方（卡片上下文路由或用户选择），不来自 zip 内容（BR-CAT02）。
+        """
+        if category and get_config().category.game_category_enabled:
+            category_dir = get_author_dir(game_root, category)
+            return get_author_dir(category_dir, author)
+        return get_author_dir(game_root, author)
 
     def install_to_game(
         self,
         zipmod_path: Path,
         confirm_upgrade: bool = False,
         confirm_downgrade: bool = False,
+        category: str | None = None,
     ) -> InstallResult:
         """
         将 .zipmod 安装到游戏 Mod 路径。
@@ -118,9 +374,9 @@ class ModService:
         流程（F04-2）：
           1. 解析 manifest.xml
           2. 重复检测（游戏+仓库）
-          3. 目标目录 = {游戏Mod路径}/{作者名}/
+          3. 目标目录 = {游戏Mod路径}/{分类}/{作者名}/（F19，开关关/无分类回退 {作者名}/）
           4. 复制 zipmod 文件
-          5. 写入数据库
+          5. 写入数据库（含 game_relative_path）
 
         重复处理：
           - SAME_VERSION: 拒绝
@@ -159,11 +415,11 @@ class ModService:
         )
 
         if dup.is_blocked:
-            logger.info("安装被阻止（同版本已存在）: {} v{}", manifest.name, manifest.version)
+            logger.info("安装被阻止（同版本已存在）: {} {}", manifest.name, display_version(manifest.version))
             return InstallResult(
                 success=False,
                 message=(
-                    f"已安装相同版本的 Mod：{manifest.name} v{manifest.version}\n"
+                    f"已安装相同版本的 Mod：{manifest.name} {display_version(manifest.version)}\n"
                     f"GUID: {manifest.guid}"
                 ),
                 duplicate_report=dup,
@@ -172,7 +428,7 @@ class ModService:
 
         if dup.needs_confirmation:
             if dup.result == DuplicateResult.NEWER_VERSION and not confirm_upgrade:
-                logger.info("需要确认升级: {} v{} → v{}", manifest.name, dup.existing_version, manifest.version)
+                logger.info("需要确认升级: {} {} → {}", manifest.name, display_version(dup.existing_version), display_version(manifest.version))
                 return InstallResult(
                     success=False,
                     message="NEWER_VERSION_NEEDS_CONFIRM",
@@ -180,7 +436,7 @@ class ModService:
                     manifest=manifest,
                 )
             if dup.result == DuplicateResult.OLDER_VERSION and not confirm_downgrade:
-                logger.info("需要确认降级: {} v{} → v{}", manifest.name, dup.existing_version, manifest.version)
+                logger.info("需要确认降级: {} {} → {}", manifest.name, display_version(dup.existing_version), display_version(manifest.version))
                 return InstallResult(
                     success=False,
                     message="OLDER_VERSION_NEEDS_CONFIRM",
@@ -188,40 +444,40 @@ class ModService:
                     manifest=manifest,
                 )
 
-        # 4. 如果有旧版本，先删除
-        if dup.existing_mod is not None:
-            logger.info("移除旧版本: {} v{} (GUID={})", manifest.name, dup.existing_version, manifest.guid)
-            self._remove_mod_files(dup.existing_mod, config.game_mod_path)
-            self.session.delete(dup.existing_mod)
-            self.session.flush()
-
-        # 5. 复制文件到目标目录
-        author_dir = get_author_dir(game_root, manifest.author)
-        logger.debug("安装目标目录: {}", author_dir)
+        # 4. 复制文件到目标目录（F19 分类布局）
+        #    F04-8: 先复制成功、再删旧版本 —— 复制失败时旧 Mod 完整保留
+        target_dir = self._game_target_dir(game_root, category, manifest.author)
+        logger.debug("安装目标目录: {}", target_dir)
 
         try:
             dest_file = safe_copy(
                 src=zipmod_path,
-                dst_dir=author_dir,
-                author=manifest.display_author,
+                dst_dir=target_dir,
                 file_name=zipmod_path.name,
                 version=manifest.version,
             )
             logger.info("文件复制成功: {} → {}", zipmod_path.name, dest_file)
         except OSError as e:
-            logger.error("文件复制失败: {} → {} - {}", zipmod_path.name, author_dir, e)
+            logger.error("文件复制失败: {} → {} - {}", zipmod_path.name, target_dir, e)
             return InstallResult(
                 success=False,
                 message=f"文件复制失败：{e}",
                 manifest=manifest,
             )
 
-        # 6. 数据库记录
+        # 5. 复制成功后移除旧版本（升级/降级）
+        if dup.existing_mod is not None:
+            logger.info("移除旧版本: {} {} (GUID={})", manifest.name, display_version(dup.existing_version), manifest.guid)
+            self._remove_mod_files(dup.existing_mod, config.game_mod_path)
+            self.session.delete(dup.existing_mod)
+            self.session.flush()
+
+        # 6. 数据库记录（持久化 game_relative_path，F19-6）
         mod = Mod(
             guid=manifest.guid,
             name=manifest.name,
             version=manifest.version,
-            author=manifest.author,
+            author=_normalize_author(manifest.author),
             author_normalized=manifest.author_normalized,
             description=manifest.description,
             website=manifest.website,
@@ -229,6 +485,7 @@ class ModService:
             location=ModLocation.GAME,
             status=ModStatus.ENABLED,
             installed_at=datetime.now(),
+            game_relative_path=compute_relative_path(game_root, dest_file),
         )
         self.session.add(mod)
 
@@ -238,14 +495,14 @@ class ModService:
             mod_name=manifest.name,
             mod_guid=manifest.guid,
             location="game",
-            detail=f"安装 v{manifest.version} → {dest_file}",
+            detail=f"安装 {display_version(manifest.version)} → {dest_file}",
         )
 
         self.session.commit()
 
         return InstallResult(
             success=True,
-            message=f"安装成功：{manifest.name} v{manifest.version}",
+            message=f"安装成功：{manifest.name} {display_version(manifest.version)}",
             mod=mod,
             manifest=manifest,
         )
@@ -297,10 +554,10 @@ class ModService:
         )
 
         if dup.is_blocked:
-            logger.info("添加到仓库被阻止（同版本已存在）: {} v{}", manifest.name, manifest.version)
+            logger.info("添加到仓库被阻止（同版本已存在）: {} {}", manifest.name, display_version(manifest.version))
             return InstallResult(
                 success=False,
-                message=f"仓库中已存在相同版本的 Mod：{manifest.name} v{manifest.version}",
+                message=f"仓库中已存在相同版本的 Mod：{manifest.name} {display_version(manifest.version)}",
                 duplicate_report=dup,
                 manifest=manifest,
             )
@@ -321,13 +578,7 @@ class ModService:
                     manifest=manifest,
                 )
 
-        # 4. 移除旧版本
-        if dup.existing_mod is not None:
-            self._remove_mod_files(dup.existing_mod, config.repo_path)
-            self.session.delete(dup.existing_mod)
-            self.session.flush()
-
-        # 5. 复制
+        # 4. 复制（F04-8: 先复制成功、再删旧版本，失败时旧 Mod 完整保留）
         author_dir = get_author_dir(repo_root, manifest.author)
         logger.debug("仓库目标目录: {}", author_dir)
 
@@ -335,7 +586,6 @@ class ModService:
             dest_file = safe_copy(
                 src=zipmod_path,
                 dst_dir=author_dir,
-                author=manifest.display_author,
                 file_name=zipmod_path.name,
                 version=manifest.version,
             )
@@ -348,12 +598,18 @@ class ModService:
                 manifest=manifest,
             )
 
+        # 5. 复制成功后移除旧版本（升级/降级）
+        if dup.existing_mod is not None:
+            self._remove_mod_files(dup.existing_mod, config.repo_path)
+            self.session.delete(dup.existing_mod)
+            self.session.flush()
+
         # 6. 数据库
         mod = Mod(
             guid=manifest.guid,
             name=manifest.name,
             version=manifest.version,
-            author=manifest.author,
+            author=_normalize_author(manifest.author),
             author_normalized=manifest.author_normalized,
             description=manifest.description,
             website=manifest.website,
@@ -370,14 +626,14 @@ class ModService:
             mod_name=manifest.name,
             mod_guid=manifest.guid,
             location="repo",
-            detail=f"添加 v{manifest.version} → {dest_file}",
+            detail=f"添加 {display_version(manifest.version)} → {dest_file}",
         )
 
         self.session.commit()
 
         return InstallResult(
             success=True,
-            message=f"已添加到仓库：{manifest.name} v{manifest.version}",
+            message=f"已添加到仓库：{manifest.name} {display_version(manifest.version)}",
             mod=mod,
             manifest=manifest,
         )
@@ -391,9 +647,11 @@ class ModService:
         zipmod_path: Path,
         confirm_upgrade: bool = False,
         confirm_downgrade: bool = False,
+        category: str | None = None,
     ) -> InstallResult:
         """
         安装并收藏：先添加到仓库，再安装到游戏（Q-02 确认流程）。
+        category 仅作用于游戏端安装（F19，仓库端不分类）。
         """
         logger.info("执行安装并收藏: {}", zipmod_path.name)
         # 先添加到仓库
@@ -406,17 +664,18 @@ class ModService:
             logger.warning("安装并收藏 - 添加到仓库失败: {}", repo_result.message)
             return repo_result
 
-        # 再从仓库安装到游戏
+        # 再安装到游戏
         game_result = self.install_to_game(
             zipmod_path,
             confirm_upgrade=confirm_upgrade,
             confirm_downgrade=confirm_downgrade,
+            category=category,
         )
 
         if game_result.success:
             game_result.message = (
                 f"安装并收藏成功：{game_result.manifest.name} "
-                f"v{game_result.manifest.version}"
+                f"{display_version(game_result.manifest.version)}"
             )
         return game_result
 
@@ -435,16 +694,13 @@ class ModService:
 
         # 删除文件
         if mod.location == ModLocation.GAME:
-            # GAME 端保持原状
+            # GAME 端优先用 game_relative_path（F19-6），为空回退作者目录旧公式
             base_path = config.game_mod_path
-            author_dir = get_author_dir(Path(base_path), mod.author)
-            file_path = author_dir / mod.current_file_name
+            file_path = resolve_game_mod_path(mod, Path(base_path))
         else:
             # REPO 端优先用 repo_relative_path
             base_path = config.repo_path
             file_path = resolve_repo_mod_path(mod, Path(base_path))
-            # REPO 端也需要 author_dir 用于清理空目录
-            author_dir = get_author_dir(Path(base_path), mod.author)
 
         if file_path.exists():
             try:
@@ -457,10 +713,16 @@ class ModService:
                     message=f"删除文件失败：{e}",
                 )
 
-        # 清理空目录
+        # 清理空目录（GAME 端排除分类目录：分类目录即使被清空也不删除，BR-CAT06）
         if config.clean_empty_dirs:
-            clean_empty_dirs(author_dir)
-            clean_empty_dirs(Path(base_path))
+            clean_empty_dirs(file_path.parent)
+            if mod.location == ModLocation.GAME:
+                clean_empty_dirs(
+                    Path(base_path),
+                    exclude_names=set(config.category.category_names),
+                )
+            else:
+                clean_empty_dirs(Path(base_path))
 
         # 日志
         op_type = "uninstall" if mod.location == ModLocation.GAME else "repo_remove"
@@ -509,11 +771,12 @@ class ModService:
             return InstallResult(success=True, message="Mod 已经是禁用状态")
 
         config = get_config()
-        author_dir = get_author_dir(Path(config.game_mod_path), mod.author)
+        # 定位统一走 game_relative_path 优先（F19-6，basename 按当前状态替换）
+        current_path = resolve_game_mod_path(mod, Path(config.game_mod_path))
 
         if enabled:
             # 启用：.zipmod_disabled → .zipmod
-            old_path = author_dir / mod.is_disabled_file
+            old_path = current_path
             new_path = rename_extension(old_path, ".zipmod_disabled", ".zipmod")
             if new_path is None:
                 logger.warning("启用失败 - 文件不存在: {}", old_path)
@@ -526,7 +789,7 @@ class ModService:
             logger.info("启用 Mod: {} → {}", old_path, new_path)
         else:
             # 禁用：.zipmod → .zipmod_disabled
-            old_path = author_dir / mod.file_name
+            old_path = current_path
             new_path = rename_extension(old_path, ".zipmod", ".zipmod_disabled")
             if new_path is None:
                 logger.warning("禁用失败 - 文件不存在: {}", old_path)
@@ -559,11 +822,16 @@ class ModService:
     # 从仓库安装到游戏（卡片解析结果用，F15-5）
     # ═══════════════════════════════════════════════════════════
 
-    def install_from_repo(self, mod_id: int) -> InstallResult:
+    def install_from_repo(
+        self,
+        mod_id: int,
+        category: str | None = None,
+    ) -> InstallResult:
         """
         将仓库中的 Mod 安装到游戏。
 
         用于卡片解析结果中的"一键安装"功能。
+        category 为 F19 目标分类（由卡片依赖粗分路由或用户选择给出）。
         """
         repo_mod: Mod | None = self.session.get(Mod, mod_id)
         if repo_mod is None:
@@ -592,20 +860,14 @@ class ModService:
             )
             .first()
         )
-        if game_dup is not None:
-            if game_dup.version == repo_mod.version:
-                logger.info("从仓库安装被跳过（游戏已安装同版本）: {} v{}", repo_mod.name, repo_mod.version)
-                return InstallResult(
-                    success=False,
-                    message=f"游戏已安装相同版本：{repo_mod.name} v{repo_mod.version}",
-                )
-            # 版本不同 → 当作升级处理
-            logger.info("从仓库安装 - 移除游戏旧版本: {} v{}", game_dup.name, game_dup.version)
-            self._remove_mod_files(game_dup, config.game_mod_path)
-            self.session.delete(game_dup)
-            self.session.flush()
+        if game_dup is not None and game_dup.version == repo_mod.version:
+            logger.info("从仓库安装被跳过（游戏已安装同版本）: {} {}", repo_mod.name, display_version(repo_mod.version))
+            return InstallResult(
+                success=False,
+                message=f"游戏已安装相同版本：{repo_mod.name} {display_version(repo_mod.version)}",
+            )
 
-        # 从仓库复制到游戏
+        # 从仓库复制到游戏（F04-8: 先复制成功、再删游戏旧版本，失败时旧 Mod 完整保留）
         repo_path = Path(config.repo_path)
         game_path = Path(config.game_mod_path)
         src_file = resolve_repo_mod_path(repo_mod, repo_path)
@@ -617,17 +879,16 @@ class ModService:
                 message=f"仓库中文件不存在：{src_file}",
             )
 
-        game_author_dir = get_author_dir(game_path, repo_mod.author)
-        logger.debug("从仓库安装 - 复制: {} → {}", src_file, game_author_dir)
+        game_target_dir = self._game_target_dir(game_path, category, repo_mod.author)
+        logger.debug("从仓库安装 - 复制: {} → {}", src_file, game_target_dir)
         try:
             dest_file = safe_copy(
                 src=src_file,
-                dst_dir=game_author_dir,
-                author=repo_mod.author or "Unknown",
+                dst_dir=game_target_dir,
                 file_name=src_file.name,
                 version=repo_mod.version,
             )
-            logger.info("从仓库安装成功: {} v{} → {}", repo_mod.name, repo_mod.version, dest_file)
+            logger.info("从仓库安装成功: {} {} → {}", repo_mod.name, display_version(repo_mod.version), dest_file)
         except OSError as e:
             logger.error("从仓库安装文件复制失败: {} - {}", src_file.name, e)
             return InstallResult(
@@ -635,18 +896,38 @@ class ModService:
                 message=f"文件复制失败：{e}",
             )
 
+        # F24-6: 升级保留游戏行禁用状态——状态必须与磁盘扩展名同步修改，
+        # 否则下次磁盘同步会按文件后缀把状态改回启用、set_enabled 也会
+        # 解析到不存在的 _disabled 路径；改名失败降级为启用态，不阻断升级
+        preserve_disabled = game_dup is not None and game_dup.status == ModStatus.DISABLED
+        final_file = dest_file
+        if preserve_disabled and dest_file.suffix.lower() == ".zipmod":
+            renamed = rename_extension(dest_file, ".zipmod", ".zipmod_disabled")
+            if renamed is not None:
+                final_file = renamed
+            else:
+                preserve_disabled = False
+
+        # 复制成功后移除游戏旧版本（升级）
+        if game_dup is not None:
+            logger.info("从仓库安装 - 移除游戏旧版本: {} {}", game_dup.name, display_version(game_dup.version))
+            self._remove_mod_files(game_dup, config.game_mod_path)
+            self.session.delete(game_dup)
+            self.session.flush()
+
         game_mod = Mod(
             guid=repo_mod.guid,
             name=repo_mod.name,
             version=repo_mod.version,
-            author=repo_mod.author,
+            author=_normalize_author(repo_mod.author),
             author_normalized=repo_mod.author_normalized,
             description=repo_mod.description,
             website=repo_mod.website,
-            file_name=dest_file.name,
+            file_name=final_file.name,
             location=ModLocation.GAME,
-            status=ModStatus.ENABLED,
+            status=ModStatus.DISABLED if preserve_disabled else ModStatus.ENABLED,
             installed_at=datetime.now(),
+            game_relative_path=compute_relative_path(game_path, final_file),
         )
         self.session.add(game_mod)
 
@@ -655,14 +936,17 @@ class ModService:
             mod_name=repo_mod.name,
             mod_guid=repo_mod.guid,
             location="game",
-            detail=f"从仓库安装 v{repo_mod.version}",
+            detail=(
+                f"从仓库安装 {display_version(repo_mod.version)}"
+                + ("（保持禁用）" if preserve_disabled else "")
+            ),
         )
 
         self.session.commit()
 
         return InstallResult(
             success=True,
-            message=f"已安装到游戏：{repo_mod.name} v{repo_mod.version}",
+            message=f"已安装到游戏：{repo_mod.name} {display_version(repo_mod.version)}",
             mod=game_mod,
         )
 
@@ -703,24 +987,18 @@ class ModService:
             )
             .first()
         )
-        if repo_dup is not None:
-            if repo_dup.version == game_mod.version:
-                logger.info("添加到仓库被跳过（仓库已存在同版本）: {} v{}", game_mod.name, game_mod.version)
-                return InstallResult(
-                    success=False,
-                    message=f"仓库中已存在相同版本：{game_mod.name} v{game_mod.version}",
-                )
-            # 版本不同 → 移除仓库旧版本
-            logger.info("添加到仓库 - 移除仓库旧版本: {} v{}", repo_dup.name, repo_dup.version)
-            self._remove_mod_files(repo_dup, config.repo_path)
-            self.session.delete(repo_dup)
-            self.session.flush()
+        if repo_dup is not None and repo_dup.version == game_mod.version:
+            logger.info("添加到仓库被跳过（仓库已存在同版本）: {} {}", game_mod.name, display_version(game_mod.version))
+            return InstallResult(
+                success=False,
+                message=f"仓库中已存在相同版本：{game_mod.name} {display_version(game_mod.version)}",
+            )
 
-        # 从游戏复制到仓库
+        # 从游戏复制到仓库（源定位走 game_relative_path 优先，F19-6）
+        # F04-8: 先复制成功、再删仓库旧版本，失败时旧 Mod 完整保留
         game_path = Path(config.game_mod_path)
         repo_path = Path(config.repo_path)
-        author_dir = get_author_dir(game_path, game_mod.author)
-        src_file = author_dir / game_mod.current_file_name
+        src_file = resolve_game_mod_path(game_mod, game_path)
 
         if not src_file.exists():
             logger.error("添加到仓库失败 - 游戏文件不存在: {}", src_file)
@@ -735,11 +1013,10 @@ class ModService:
             dest_file = safe_copy(
                 src=src_file,
                 dst_dir=repo_author_dir,
-                author=game_mod.author or "Unknown",
                 file_name=src_file.name,
                 version=game_mod.version,
             )
-            logger.info("添加到仓库成功: {} v{} → {}", game_mod.name, game_mod.version, dest_file)
+            logger.info("添加到仓库成功: {} {} → {}", game_mod.name, display_version(game_mod.version), dest_file)
         except OSError as e:
             logger.error("添加到仓库文件复制失败: {} - {}", src_file.name, e)
             return InstallResult(
@@ -747,11 +1024,18 @@ class ModService:
                 message=f"文件复制失败：{e}",
             )
 
+        # 复制成功后移除仓库旧版本（升级）
+        if repo_dup is not None:
+            logger.info("添加到仓库 - 移除仓库旧版本: {} {}", repo_dup.name, display_version(repo_dup.version))
+            self._remove_mod_files(repo_dup, config.repo_path)
+            self.session.delete(repo_dup)
+            self.session.flush()
+
         repo_mod = Mod(
             guid=game_mod.guid,
             name=game_mod.name,
             version=game_mod.version,
-            author=game_mod.author,
+            author=_normalize_author(game_mod.author),
             author_normalized=game_mod.author_normalized,
             description=game_mod.description,
             website=game_mod.website,
@@ -768,16 +1052,468 @@ class ModService:
             mod_name=game_mod.name,
             mod_guid=game_mod.guid,
             location="repo",
-            detail=f"从游戏添加 v{game_mod.version}",
+            detail=f"从游戏添加 {display_version(game_mod.version)}",
         )
 
         self.session.commit()
 
         return InstallResult(
             success=True,
-            message=f"已加入仓库：{game_mod.name} v{game_mod.version}",
+            message=f"已加入仓库：{game_mod.name} {display_version(game_mod.version)}",
             mod=repo_mod,
         )
+
+    # ═══════════════════════════════════════════════════════════
+    # 仓库版本巡检 / 一键升级（F24）
+    # ═══════════════════════════════════════════════════════════
+
+    def scan_repo_versions(self) -> VersionScanReport:
+        """全表对比 GAME 与 REPO 同 GUID 版本（F24-1）。
+
+        - packaging.Version 严格比较；BR-V03 保守口径：任一侧 InvalidVersion
+          → 该配对整体不参与（既不算仓库更新也不算游戏更新）
+        - 版本相等（含 "1.0" vs "v1.0" 这类解析后相等的原始串）→ 不列出
+        - GUID 仅单侧存在 → 不参与（不是版本差异）
+        - 纯 DB 查询 + 内存比较，不触碰磁盘；有差异时记一条聚合操作日志
+        """
+        report = VersionScanReport()
+        game_mods = self.session.query(Mod).filter(Mod.location == ModLocation.GAME).all()
+        repo_by_guid = {
+            m.guid: m
+            for m in self.session.query(Mod).filter(Mod.location == ModLocation.REPO).all()
+        }
+        report.scanned_game = len(game_mods)
+        report.scanned_repo = len(repo_by_guid)
+        category_names = get_config().category.category_names
+
+        for game_mod in game_mods:
+            repo_mod = repo_by_guid.get(game_mod.guid)
+            if repo_mod is None:
+                continue  # GUID 单侧存在 → 不是版本差异
+            try:
+                game_v = Version(game_mod.version)
+                repo_v = Version(repo_mod.version)
+            except InvalidVersion:
+                # BR-V03：版本无法解析时不断言新旧，配对整体排除
+                report.skipped_unparseable += 1
+                continue
+            if repo_v > game_v:
+                report.repo_newer.append(
+                    VersionDiffItem(
+                        guid=game_mod.guid,
+                        name=game_mod.name or repo_mod.name or game_mod.guid,
+                        author=game_mod.author or repo_mod.author or "",
+                        game_version=game_mod.version,
+                        repo_version=repo_mod.version,
+                        game_mod_id=game_mod.id,
+                        repo_mod_id=repo_mod.id,
+                        category=derive_category_from_relpath(
+                            game_mod.game_relative_path, category_names
+                        ),
+                    )
+                )
+            elif game_v > repo_v:
+                # 游戏更新（降级方向）：仅参考展示，不推导分类（F24-3 不可操作）
+                report.game_newer.append(
+                    VersionDiffItem(
+                        guid=game_mod.guid,
+                        name=game_mod.name or repo_mod.name or game_mod.guid,
+                        author=game_mod.author or repo_mod.author or "",
+                        game_version=game_mod.version,
+                        repo_version=repo_mod.version,
+                        game_mod_id=game_mod.id,
+                        repo_mod_id=repo_mod.id,
+                    )
+                )
+            # 相等 → 不列出
+
+        if report.repo_newer or report.game_newer:
+            self._log_operation(
+                operation="upgrade",
+                mod_name="(仓库版本巡检)",
+                mod_guid="",
+                location="game",
+                detail=report.summary()[:450],
+            )
+            self.session.commit()
+
+        logger.info("仓库版本巡检完成: {}", report.summary())
+        return report
+
+    def batch_upgrade_from_repo(
+        self,
+        repo_mod_ids: list[int],
+        progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> BatchUpgradeResult:
+        """按巡检结果批量从仓库升级游戏侧（F24-2/4/5）。
+
+        逐项复用 install_from_repo（F04-8 防丢序 + 逐项 OperationLog + 单项独立 commit）。
+        分类在执行时从 GAME 行 game_relative_path 现场推导（保证与磁盘当前布局
+        一致，避免分类布局的 Mod 被隐式搬到平铺目录）；游戏行已不在（被卸载）
+        → 按 None 平铺安装走全新安装分支。单项失败/意外异常不中断批量。
+        """
+        result = BatchUpgradeResult(total=len(repo_mod_ids))
+        config = get_config()
+
+        # 前置路径校验（镜像 batch_install 口径）：两侧任一未配置 → 全部 FAILED
+        if not config.game_mod_path or not config.repo_path:
+            reason = (
+                "未配置游戏 Mod 路径，请先在设置中配置"
+                if not config.game_mod_path
+                else "未配置仓库路径，请先在设置中配置"
+            )
+            for repo_mod_id in repo_mod_ids:
+                item = UpgradeItemResult(guid="", name=f"ID={repo_mod_id}", game_version="", repo_version="",
+                                         status=BatchItemStatus.FAILED, message=reason)
+                result.items.append(item)
+                result.failed_count += 1
+            return result
+
+        category_names = config.category.category_names
+        total = len(repo_mod_ids)
+        for idx, repo_mod_id in enumerate(repo_mod_ids):
+            repo_mod = self.session.get(Mod, repo_mod_id)
+            name = repo_mod.name if repo_mod is not None else f"ID={repo_mod_id}"
+            if progress_callback:
+                progress_callback(idx, total, name)
+
+            game_row = (
+                self.get_game_mod_by_guid(repo_mod.guid) if repo_mod is not None else None
+            )
+            item = UpgradeItemResult(
+                guid=repo_mod.guid if repo_mod is not None else "",
+                name=name,
+                game_version=game_row.version if game_row is not None else "",
+                repo_version=repo_mod.version if repo_mod is not None else "",
+            )
+            category = (
+                derive_category_from_relpath(game_row.game_relative_path, category_names)
+                if game_row is not None
+                else None
+            )
+            try:
+                res = self.install_from_repo(repo_mod_id, category)
+            except Exception as e:  # noqa: BLE001 - 单项意外异常回滚后继续批量
+                self.session.rollback()
+                item.status = BatchItemStatus.FAILED
+                item.message = f"升级异常：{e}"
+                result.items.append(item)
+                result.failed_count += 1
+                continue
+
+            if res.success:
+                item.status = BatchItemStatus.SUCCESS
+                result.success_count += 1
+            else:
+                # 失败原因甄别：执行后游戏行版本已与仓库一致 → 同版本跳过
+                # （扫描后游戏侧已被更新等场景），比匹配 message 子串稳健
+                game_now = (
+                    self.get_game_mod_by_guid(item.guid)
+                    if repo_mod is not None and item.guid
+                    else None
+                )
+                if game_now is not None and game_now.version == repo_mod.version:
+                    item.status = BatchItemStatus.SKIPPED
+                    result.skipped_count += 1
+                else:
+                    item.status = BatchItemStatus.FAILED
+                    result.failed_count += 1
+            item.message = res.message
+            result.items.append(item)
+
+        if progress_callback:
+            progress_callback(total, total, "完成")
+        logger.info(
+            "批量升级完成: 总={} 成功={} 跳过={} 失败={}",
+            result.total, result.success_count, result.skipped_count, result.failed_count,
+        )
+        return result
+
+    # ═══════════════════════════════════════════════════════════
+    # 重复项检查 / 清理（F22）
+    # ═══════════════════════════════════════════════════════════
+
+    def scan_duplicates(
+        self,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> DuplicateScanReport:
+        """扫描磁盘找出同位置内同 GUID 的重复文件（F22-1/2/3）。
+
+        实现口径（候选清单 B5 定案）：以磁盘扫描 + manifest 解析为准，
+        不查库——DB 唯一索引 (location, guid) 使同位置多文件在库里只留
+        一行，纯查库会漏报。GAME / REPO 内部**分别**判重，跨位置各一份
+        同 GUID 不算重复（BR-D04 正常收藏形态）。
+
+        MD5 只在重复组内补算（F22-3），用于标注「字节级完全相同」的副本；
+        不做全量 MD5 扫描。
+
+        Args:
+            progress_callback: 进度回调 (当前序号, 总数, 文件名)。
+                解析阶段跨两侧全局计数，MD5 阶段按组内文件数单独计数。
+
+        Returns:
+            DuplicateScanReport（含建议保留项勾选，F22-4）
+        """
+        report = DuplicateScanReport()
+        config = get_config()
+
+        # ── 阶段 1：收集两侧文件清单（rglob 先拿全量，解析进度才能全局计数）──
+        targets: list[tuple[ModLocation, Path]] = []
+        for location, path_str, label in (
+            (ModLocation.GAME, config.game_mod_path, "游戏 Mod 路径"),
+            (ModLocation.REPO, config.repo_path, "仓库路径"),
+        ):
+            reason = ""
+            if not path_str:
+                reason = f"未配置{label}"
+            elif not Path(path_str).exists():
+                reason = f"{label}不存在：{path_str}"
+            if reason:
+                if location == ModLocation.GAME:
+                    report.skipped_game = reason
+                else:
+                    report.skipped_repo = reason
+                continue
+            targets.append((location, Path(path_str)))
+
+        file_lists: list[tuple[ModLocation, Path, list[Path]]] = []
+        total = 0
+        for location, base_path in targets:
+            files = sorted(
+                f for f in base_path.rglob("*")
+                if f.is_file() and f.suffix.lower() in (".zipmod", ".zipmod_disabled")
+            )
+            file_lists.append((location, base_path, files))
+            if location == ModLocation.GAME:
+                report.scanned_game = len(files)
+            else:
+                report.scanned_repo = len(files)
+            total += len(files)
+
+        # ── 阶段 2：解析 manifest，按 (位置, GUID) 分组 ──────────
+        by_group: dict[tuple[ModLocation, str], list[tuple[Path, ModManifest]]] = {}
+        done = 0
+        for location, base_path, files in file_lists:
+            for file_path in files:
+                if progress_callback:
+                    progress_callback(done, total, file_path.name)
+                done += 1
+                try:
+                    manifest = self.manifest_svc.parse_from_zipmod(file_path)
+                except ManifestParseError as e:
+                    report.parse_failures.append(
+                        DuplicateParseFailure(file_path, location, str(e))
+                    )
+                    continue
+                by_group.setdefault((location, manifest.guid), []).append(
+                    (file_path, manifest)
+                )
+
+        # ── 阶段 3：构建重复组 + 组内补算 MD5（F22-3）───────────
+        md5_total = sum(len(members) for members in by_group.values() if len(members) > 1)
+        md5_done = 0
+        for (location, guid), members in by_group.items():
+            if len(members) < 2:
+                continue
+            base_path = next(base for loc, base in targets if loc == location)
+            entries: list[DuplicateFileEntry] = []
+            for file_path, manifest in members:
+                if progress_callback and md5_total:
+                    progress_callback(md5_done, md5_total, f"MD5 {file_path.name}")
+                md5_done += 1
+                try:
+                    mtime = file_path.stat().st_mtime
+                    size = file_path.stat().st_size
+                except OSError:
+                    mtime = datetime.now().timestamp()
+                    size = 0
+                entries.append(DuplicateFileEntry(
+                    path=file_path,
+                    location=location,
+                    guid=guid,
+                    name=manifest.name,
+                    version=manifest.version,
+                    author=manifest.author,
+                    size=size,
+                    mtime=mtime,
+                    is_disabled=file_path.name.lower().endswith(".zipmod_disabled"),
+                    relative_path=file_path.relative_to(base_path).as_posix(),
+                    md5=self._compute_md5(file_path),
+                ))
+
+            # 字节级相同标注：组内 MD5 出现次数 > 1 的文件互为副本（删一份零风险）
+            md5_counts: dict[str, int] = {}
+            for e in entries:
+                if e.md5:
+                    md5_counts[e.md5] = md5_counts.get(e.md5, 0) + 1
+            for e in entries:
+                e.has_identical_twin = bool(e.md5) and md5_counts[e.md5] > 1
+
+            keeper = self._choose_keeper(entries)
+            keeper.suggested_keep = True
+            rest = sorted(
+                (e for e in entries if e is not keeper),
+                key=lambda e: e.mtime,
+                reverse=True,
+            )
+            report.groups.append(DuplicateGroup(
+                guid=guid,
+                name=keeper.name,
+                author=keeper.author,
+                location=location,
+                files=[keeper] + rest,
+            ))
+
+        report.groups.sort(key=lambda g: (
+            g.location != ModLocation.GAME,   # 游戏组在前
+            (g.author or "").lower(),
+            g.name.lower(),
+        ))
+        if progress_callback and md5_total:
+            progress_callback(md5_total, md5_total, "完成")
+
+        logger.info("重复项检查完成: {}", report.summary().replace("\n", " | "))
+        return report
+
+    def cleanup_duplicates(
+        self,
+        entries: list[DuplicateFileEntry],
+        progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> DuplicateCleanupResult:
+        """删除选中的重复文件并对账数据库（F22-5：用户确认后才调用，首期硬删除）。
+
+        删除后对每个发生实际删除的位置跑一次增量磁盘同步（sync_from_disk）
+        把 DB 行重新对准磁盘幸存文件——判重以磁盘为准，被删的可能正是
+        DB 跟踪的文件。单项失败不中断批量；对账失败不影响已完成的删除，
+        错误记入 sync_errors 提示用户手动「同步磁盘」。
+
+        Args:
+            entries: 待删除的文件（通常来自 DuplicateScanReport 的勾选项）
+            progress_callback: 进度回调 (当前序号, 总数, 文件名)，
+                之后透传给 sync_from_disk（计数切到对账阶段）
+
+        Returns:
+            DuplicateCleanupResult
+        """
+        result = DuplicateCleanupResult(total=len(entries))
+        config = get_config()
+        deleted_by_location: dict[ModLocation, list[CleanupItemResult]] = {}
+
+        for idx, entry in enumerate(entries):
+            if progress_callback:
+                progress_callback(idx, len(entries), entry.path.name)
+            item = CleanupItemResult(entry=entry)
+            if not entry.path.exists():
+                item.status = BatchItemStatus.SKIPPED
+                item.message = "文件已不存在（可能已被手动删除）"
+                result.skipped_count += 1
+            else:
+                try:
+                    entry.path.unlink()
+                except OSError as e:
+                    item.status = BatchItemStatus.FAILED
+                    item.message = f"删除失败：{e}"
+                    result.failed_count += 1
+                    logger.error("重复项清理 - 删除失败: {} - {}", entry.path, e)
+                else:
+                    item.status = BatchItemStatus.SUCCESS
+                    item.message = f"已删除 {entry.relative_path}"
+                    result.success_count += 1
+                    deleted_by_location.setdefault(entry.location, []).append(item)
+                    logger.info("重复项清理 - 删除: {} (GUID={})", entry.path, entry.guid)
+            result.items.append(item)
+
+        if progress_callback:
+            progress_callback(len(entries), len(entries), "完成")
+
+        # 空目录清理（镜像 uninstall：GAME 端保护分类目录，BR-CAT06）
+        if config.clean_empty_dirs and deleted_by_location:
+            for location in deleted_by_location:
+                base_str = (
+                    config.game_mod_path if location == ModLocation.GAME
+                    else config.repo_path
+                )
+                if not base_str or not Path(base_str).exists():
+                    continue
+                if location == ModLocation.GAME:
+                    clean_empty_dirs(
+                        Path(base_str), exclude_names=set(config.category.category_names)
+                    )
+                else:
+                    clean_empty_dirs(Path(base_str))
+
+        # 聚合操作日志 + 增量对账（每位置一条，仅实际发生删除的位置）
+        for location in (ModLocation.GAME, ModLocation.REPO):
+            deleted = deleted_by_location.get(location)
+            if not deleted:
+                continue
+            names = "、".join(i.entry.path.name for i in deleted)[:300]
+            self._log_operation(
+                operation="dedup",
+                mod_name="(重复项清理)",
+                mod_guid="",
+                location=location.value,
+                detail=f"硬删除 {len(deleted)} 个重复文件：{names}",
+            )
+            self.session.commit()
+
+            try:
+                result.sync_reports.append(
+                    self.sync_from_disk(location, progress_callback=progress_callback)
+                )
+            except Exception as e:  # noqa: BLE001 - 对账失败不影响已完成的删除
+                self.session.rollback()
+                result.sync_errors.append(f"[{location.value}] {e}")
+                logger.error("重复项清理 - 对账失败({}): {}", location.value, e)
+
+        logger.info(
+            "重复项清理完成: 删除={} 跳过={} 失败={} 对账失败={}",
+            result.success_count, result.skipped_count, result.failed_count,
+            len(result.sync_errors),
+        )
+        return result
+
+    @staticmethod
+    def _compute_md5(path: Path) -> str:
+        """计算文件 MD5（分块读取，zipmod 可达数百 MB）；失败返回空串不阻断扫描"""
+        digest = hashlib.md5()
+        try:
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError as e:
+            logger.warning("重复项检查 - MD5 计算失败: {} - {}", path.name, e)
+            return ""
+        return digest.hexdigest()
+
+    @staticmethod
+    def _choose_keeper(files: list[DuplicateFileEntry]) -> DuplicateFileEntry:
+        """选出组内建议保留的文件（F22-4「保留最新版」）。
+
+        规则：可解析版本中取最高者（BR-V01）；并列或全组版本不可解析时
+        先启用态、后修改时间新者（禁用副本多为手动留的旧备份，不作首选；
+        BR-V03：版本无法比较时不断言，退到时间维度）。
+        """
+        def tie_break(e: DuplicateFileEntry) -> tuple[bool, float]:
+            return (not e.is_disabled, e.mtime)
+
+        def parse(e: DuplicateFileEntry) -> Version | None:
+            try:
+                return Version(e.version)
+            except InvalidVersion:
+                return None
+
+        best = files[0]
+        best_v = parse(best)
+        for e in files[1:]:
+            v = parse(e)
+            if v is None:
+                continue
+            if best_v is None or v > best_v or (v == best_v and tie_break(e) > tie_break(best)):
+                best, best_v = e, v
+        if best_v is None:
+            best = max(files, key=tie_break)
+        return best
 
     # ═══════════════════════════════════════════════════════════
     # 查询
@@ -877,6 +1613,60 @@ class ModService:
             "disabled": total - enabled,
         }
 
+    # ── 操作日志查询（F10-3/4）──────────────────────────────
+
+    def get_operation_logs(
+        self,
+        operation: str = "",
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[OperationLog]:
+        """查询操作日志（时间倒序，F10-3）。
+
+        Args:
+            operation: 操作类型过滤（空串 = 全部类型）
+            limit: 每页数量，None 表示不限制
+            offset: 跳过数量（分页）
+        """
+        query = self.session.query(OperationLog)
+        if operation:
+            query = query.filter(OperationLog.operation == operation)
+        query = query.order_by(
+            OperationLog.created_at.desc(), OperationLog.id.desc()
+        )
+        if limit is not None:
+            query = query.limit(limit)
+        if offset:
+            query = query.offset(offset)
+        return query.all()
+
+    def get_operation_logs_count(self, operation: str = "") -> int:
+        """获取操作日志总数（用于分页，F10-3）"""
+        query = self.session.query(OperationLog)
+        if operation:
+            query = query.filter(OperationLog.operation == operation)
+        return query.count()
+
+    def cleanup_old_logs(self, days: int = LOG_RETENTION_DAYS) -> int:
+        """删除超过保留期限的操作日志（F10-4），返回删除行数。
+
+        以 created_at 早于 {今天 - days 天} 为界（早于即删，不含恰好等于）。
+        """
+        cutoff = datetime.now() - timedelta(days=days)
+        deleted = (
+            self.session.query(OperationLog)
+            .filter(OperationLog.created_at < cutoff)
+            .delete()
+        )
+        if deleted:
+            self.session.commit()
+            logger.info("清理过期操作日志: 删除 {} 行（保留近 {} 天）", deleted, days)
+        else:
+            # 0 行也必须收尾：DELETE 已开启写事务，悬挂在长期存活的会话上
+            # 会占住 SQLite 写锁，把后续其它连接（同步/安装 worker）锁死
+            self.session.rollback()
+        return deleted
+
     def group_by_author(
         self,
         location: ModLocation,
@@ -973,18 +1763,22 @@ class ModService:
                 continue
             seen_guids.add(manifest.guid)
 
-            # 检查 author 目录
-            parent_dir = zipmod_file.parent
-            if parent_dir != base_path:
-                # 文件在子目录中，用目录名推断作者
-                if not manifest.author:
-                    manifest.author = parent_dir.name
+            # 作者推断：
+            #   GAME 端用 BR-CAT03 护栏（分类段自底向上排除，不受分类开关控制）；
+            #   REPO 端维持单层父目录推断（仓库不分类）。
+            if not manifest.author:
+                if location == ModLocation.GAME:
+                    manifest.author = infer_author_from_path(
+                        zipmod_file, base_path, config.category.category_names
+                    ) or ""
+                elif zipmod_file.parent != base_path:
+                    manifest.author = zipmod_file.parent.name
 
             mod = Mod(
                 guid=manifest.guid,
                 name=manifest.name,
                 version=manifest.version,
-                author=manifest.author,
+                author=_normalize_author(manifest.author),
                 author_normalized=manifest.author_normalized,
                 description=manifest.description,
                 website=manifest.website,
@@ -998,12 +1792,322 @@ class ModService:
                     zipmod_file.relative_to(base_path).as_posix()
                     if location == ModLocation.REPO else ""
                 ),
+                game_relative_path=(
+                    zipmod_file.relative_to(base_path).as_posix()
+                    if location == ModLocation.GAME else ""
+                ),
             )
             self.session.add(mod)
             count += 1
 
         self.session.commit()
         return count
+
+    def sync_from_disk(
+        self,
+        location: ModLocation,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> SyncReport:
+        """以磁盘为准增量同步数据库（不改动磁盘文件）。
+
+        与 refresh_from_disk 的区别：
+          - 增量 diff 而非清空重建，保留 notes / installed_at
+          - 扫描 .zipmod 与 .zipmod_disabled，按后缀同步禁用状态
+          - 记录 OperationLog 摘要
+
+        Args:
+            location: 同步位置（GAME / REPO）
+            progress_callback: 进度回调 (当前序号, 总数, 文件名)
+
+        Returns:
+            SyncReport 同步报告
+        """
+        report = SyncReport(location=location)
+
+        config = get_config()
+        if location == ModLocation.GAME:
+            base_str, label = config.game_mod_path, "游戏 Mod 路径"
+        else:
+            base_str, label = config.repo_path, "仓库路径"
+        if not base_str:
+            report.skipped = True
+            report.message = f"未配置{label}"
+            return report
+        base_path = Path(base_str)
+        if not base_path.exists():
+            report.skipped = True
+            report.message = f"{label}不存在：{base_str}"
+            return report
+
+        # ── 阶段 1：扫描磁盘，解析 manifest ──────────────────
+        disk_files = sorted(
+            f for f in base_path.rglob("*")
+            if f.is_file() and f.suffix.lower() in (".zipmod", ".zipmod_disabled")
+        )
+        report.scanned = len(disk_files)
+
+        disk_by_guid: dict[str, list[dict]] = {}
+        fail_paths: set[Path] = set()
+        for i, file_path in enumerate(disk_files):
+            if progress_callback:
+                progress_callback(i, len(disk_files), file_path.name)
+            try:
+                manifest = self.manifest_svc.parse_from_zipmod(file_path)
+            except ManifestParseError as e:
+                fail_paths.add(file_path)
+                report.parse_failures.append(SyncChangeItem(
+                    action="parse_failed", guid="", name=file_path.name,
+                    file_name=file_path.name, detail=str(e)[:200],
+                ))
+                continue
+            try:
+                mtime = file_path.stat().st_mtime
+            except OSError:
+                mtime = datetime.now().timestamp()
+            disk_by_guid.setdefault(manifest.guid, []).append({
+                "path": file_path,
+                "manifest": manifest,
+                "is_disabled": file_path.name.lower().endswith(".zipmod_disabled"),
+                "mtime": mtime,
+            })
+
+        # ── 阶段 2：加载 DB，清理同位置重复 GUID 的脏数据 ────
+        db_mods = self.session.query(Mod).filter(Mod.location == location).all()
+        report.db_before = len(db_mods)
+        db_by_guid: dict[str, Mod] = {}
+        for mod in db_mods:
+            if mod.guid in db_by_guid:
+                # 唯一索引外的历史脏数据：保留先出现的一条
+                self.session.delete(mod)
+                report.removed.append(SyncChangeItem(
+                    action="removed", guid=mod.guid, name=mod.name,
+                    file_name=mod.file_name, detail="清理重复记录",
+                ))
+            else:
+                db_by_guid[mod.guid] = mod
+
+        # ── 阶段 3：磁盘有 GUID → 新增或原地更新 ────────────
+        for guid, entries in disk_by_guid.items():
+            mod = db_by_guid.get(guid)
+
+            # 同 GUID 多文件：优先取 DB 推导路径所在文件，
+            # 否则启用态优先 + 路径字典序（保证确定性）；多余文件不动
+            chosen = None
+            if mod is not None:
+                expect = self._derive_mod_path(mod, base_path)
+                for entry in entries:
+                    if os.path.normcase(str(entry["path"])) == os.path.normcase(str(expect)):
+                        chosen = entry
+                        break
+            if chosen is None:
+                entries.sort(key=lambda e: (e["is_disabled"], str(e["path"])))
+                chosen = entries[0]
+
+            if mod is None:
+                manifest = chosen["manifest"]
+                author = _normalize_author(manifest.author)
+                if not manifest.author:
+                    # 作者推断：GAME 端用 BR-CAT03 护栏（分类段排除，
+                    # 不受分类开关控制）；REPO 端单层父目录（与 refresh_from_disk 一致）
+                    if location == ModLocation.GAME:
+                        author = _normalize_author(infer_author_from_path(
+                            chosen["path"], base_path, config.category.category_names
+                        ))
+                    elif chosen["path"].parent != base_path:
+                        author = chosen["path"].parent.name
+                new_mod = Mod(
+                    guid=guid,
+                    name=manifest.name,
+                    version=manifest.version,
+                    author=author,
+                    author_normalized=author.strip().lower(),
+                    description=manifest.description,
+                    website=manifest.website,
+                    file_name=chosen["path"].name,
+                    location=location,
+                    status=(
+                        ModStatus.DISABLED
+                        if chosen["is_disabled"] and location == ModLocation.GAME
+                        else ModStatus.ENABLED
+                    ),
+                    installed_at=datetime.fromtimestamp(chosen["mtime"]),
+                    repo_relative_path=(
+                        chosen["path"].relative_to(base_path).as_posix()
+                        if location == ModLocation.REPO else ""
+                    ),
+                    game_relative_path=(
+                        chosen["path"].relative_to(base_path).as_posix()
+                        if location == ModLocation.GAME else ""
+                    ),
+                )
+                self.session.add(new_mod)
+                report.added.append(SyncChangeItem(
+                    action="added", guid=guid, name=manifest.name,
+                    file_name=chosen["path"].name,
+                    detail=f"{display_version(manifest.version)} 作者 {author}",
+                ))
+            else:
+                item = self._apply_mod_update(
+                    mod, chosen["manifest"], chosen["path"], base_path, location,
+                )
+                if item is not None:
+                    report.updated.append(item)
+
+        # ── 阶段 4：DB 有、磁盘无该 GUID → 删除或保留 ────────
+        for guid, mod in db_by_guid.items():
+            if guid in disk_by_guid:
+                continue
+            expect = self._derive_mod_path(mod, base_path)
+            if expect.exists():
+                if expect in fail_paths:
+                    # 文件还在但解析失败（损坏 / 下载中），保留记录
+                    logger.warning("同步 - 文件解析失败，保留记录: {} ({})", expect.name, guid)
+                    continue
+                # 路径被其他 GUID 的文件占用 → 原地被替换，删旧记录（新 GUID 已在阶段 3 新增）
+                self.session.delete(mod)
+                report.removed.append(SyncChangeItem(
+                    action="removed", guid=guid, name=mod.name,
+                    file_name=mod.file_name, detail="文件被替换为其他 Mod",
+                ))
+            elif (
+                location == ModLocation.GAME
+                and any(
+                    fp.name.lower() == mod.current_file_name.lower()
+                    for fp in fail_paths
+                )
+            ):
+                # GAME 端路径是推导值（作者目录），文件可能实际在别处：
+                # 按文件名兜底匹配解析失败文件，避免误删
+                logger.warning(
+                    "同步 - 疑似解析失败，保留记录: {} ({})", mod.current_file_name, guid,
+                )
+            else:
+                # 文件已消失
+                self.session.delete(mod)
+                report.removed.append(SyncChangeItem(
+                    action="removed", guid=guid, name=mod.name,
+                    file_name=mod.file_name, detail="文件已消失",
+                ))
+
+        # ── 阶段 5：单事务提交（先 flush 删除，防御 INSERT 先于
+        #    DELETE 的 flush 顺序撞 (location, guid) 唯一索引）──
+        try:
+            self.session.flush()
+            self.session.commit()
+        except Exception as e:
+            self.session.rollback()
+            logger.error("磁盘同步失败({}): {}", location.value, e)
+            raise
+
+        if report.change_count or report.parse_failures:
+            self._log_operation(
+                operation="sync",
+                mod_name=f"(磁盘同步 {location.value})",
+                mod_guid="",
+                location=location.value,
+                detail=report.summary()[:450],
+            )
+            self.session.commit()
+
+        if progress_callback:
+            progress_callback(len(disk_files), len(disk_files), "完成")
+        logger.info("磁盘同步完成: {}", report.summary())
+        return report
+
+    @staticmethod
+    def _derive_mod_path(mod: Mod, base_path: Path) -> Path:
+        """推导 DB 记录对应的磁盘路径（与 _remove_mod_files 同一公式）"""
+        if mod.location == ModLocation.REPO:
+            return resolve_repo_mod_path(mod, base_path)
+        return resolve_game_mod_path(mod, base_path)
+
+    def _apply_mod_update(
+        self,
+        mod: Mod,
+        manifest: ModManifest,
+        file_path: Path,
+        base_path: Path,
+        location: ModLocation,
+    ) -> SyncChangeItem | None:
+        """按磁盘实际情况原地更新已有记录（保留 notes / installed_at）。
+
+        file_name 沿用代码库约定：存磁盘实际文件名（禁用时含 _disabled 后缀，
+        与 set_enabled 行为一致）。
+
+        Returns:
+            有变化时返回变更明细，无变化返回 None
+        """
+        changes: list[str] = []
+        file_name = file_path.name
+        is_disabled = file_path.name.lower().endswith(".zipmod_disabled")
+
+        if mod.file_name != file_name:
+            changes.append(f"文件名 {mod.file_name} → {file_name}")
+            mod.file_name = file_name
+
+        if location == ModLocation.REPO:
+            rel = file_path.relative_to(base_path).as_posix()
+            if mod.repo_relative_path != rel:
+                changes.append(f"路径 {mod.repo_relative_path or '(空)'} → {rel}")
+                mod.repo_relative_path = rel  # 顺带回填老数据
+        else:
+            rel = file_path.relative_to(base_path).as_posix()
+            if mod.game_relative_path != rel:
+                changes.append(f"路径 {mod.game_relative_path or '(空)'} → {rel}")
+                mod.game_relative_path = rel  # 顺带回填老数据（F19-6）
+            new_status = ModStatus.DISABLED if is_disabled else ModStatus.ENABLED
+            if mod.status != new_status:
+                old = "禁用" if mod.status == ModStatus.DISABLED else "启用"
+                new = "禁用" if new_status == ModStatus.DISABLED else "启用"
+                changes.append(f"状态 {old} → {new}")
+                mod.status = new_status
+
+        if mod.name != manifest.name:
+            changes.append(f"名称 {mod.name} → {manifest.name}")
+            mod.name = manifest.name
+        if mod.version != manifest.version:
+            changes.append(f"版本 {display_version(mod.version)} → {display_version(manifest.version)}")
+            mod.version = manifest.version
+        if (mod.description or "") != manifest.description:
+            changes.append("描述已更新")
+            mod.description = manifest.description
+        if (mod.website or "") != manifest.website:
+            changes.append("网站已更新")
+            mod.website = manifest.website
+
+        # author：仅当 manifest 有非空作者且忽略大小写不同才更新（避免大小写抖动）
+        if manifest.author and (mod.author or "").strip().lower() != manifest.author.strip().lower():
+            changes.append(f"作者 {mod.author or '(空)'} → {manifest.author}")
+            mod.author = manifest.author
+            mod.author_normalized = manifest.author_normalized
+
+        # manifest 无作者 → DB 的 author 是目录推断值（或空）。
+        # 文件被移动到其他子目录后按实际目录重新推断：
+        #   GAME 端用 BR-CAT03 护栏（分类段自底向上排除，避免把分类名
+        #   写成作者）；REPO 端用单层父目录名。定位本身已由 rel path
+        #   优先保障，此处更正主要保证作者分组展示正确。
+        # manifest 有作者时不做此更正（manifest 元数据优先于目录名）。
+        if not manifest.author and file_path.parent != base_path:
+            if location == ModLocation.GAME:
+                config = get_config()
+                dir_name = infer_author_from_path(
+                    file_path, base_path, config.category.category_names
+                ) or "Unknown"
+            else:
+                dir_name = file_path.parent.name
+            if (mod.author or "").strip().lower() != dir_name.strip().lower():
+                changes.append(
+                    f"作者目录 {mod.author or '(空)'} → {dir_name}（按实际位置更正）"
+                )
+                mod.author = dir_name
+                mod.author_normalized = dir_name.strip().lower()
+
+        if not changes:
+            return None
+        return SyncChangeItem(
+            action="updated", guid=mod.guid, name=mod.name,
+            file_name=file_name, detail="；".join(changes),
+        )
 
     # ═══════════════════════════════════════════════════════════
     # 批量安装（Batch Install）
@@ -1045,6 +2149,7 @@ class ModService:
         zipmod_paths: list[Path],
         location: ModLocation,
         progress_callback: Callable[[int, int, str], None] | None = None,
+        category: str | None = None,
     ) -> BatchInstallResult:
         """
         批量安装 / 添加 Mod。
@@ -1058,6 +2163,7 @@ class ModService:
             zipmod_paths: 要安装的 .zipmod 文件列表
             location: 目标位置（GAME / REPO）
             progress_callback: 可选进度回调 (current, total, file_name)
+            category: GAME 端目标分类（F19，REPO 端忽略）
 
         Returns:
             BatchInstallResult 包含每个文件的处理结果
@@ -1098,7 +2204,7 @@ class ModService:
             if progress_callback:
                 progress_callback(idx, len(zipmod_paths), fp.name)
 
-            item = self._batch_install_single(fp, location, base_path)
+            item = self._batch_install_single(fp, location, base_path, category)
             batch.items.append(item)
 
             if item.status == BatchItemStatus.SUCCESS:
@@ -1125,6 +2231,7 @@ class ModService:
         fp: Path,
         location: ModLocation,
         base_path: Path,
+        category: str | None = None,
     ) -> BatchItemResult:
         """批量安装中处理单个文件，不抛异常，结果封装为 BatchItemResult"""
         # 1. 解析 manifest
@@ -1143,11 +2250,11 @@ class ModService:
 
         if dup.is_blocked:
             # 同版本已存在，跳过
-            logger.debug("批量安装 - 跳过（同版本）: {} v{}", manifest.name, manifest.version)
+            logger.debug("批量安装 - 跳过（同版本）: {} {}", manifest.name, display_version(manifest.version))
             return BatchItemResult(
                 file_path=fp,
                 status=BatchItemStatus.SKIPPED,
-                message=f"已存在相同版本：{manifest.name} v{manifest.version}",
+                message=f"已存在相同版本：{manifest.name} {display_version(manifest.version)}",
                 manifest=manifest,
                 duplicate_report=dup,
             )
@@ -1155,35 +2262,31 @@ class ModService:
         if dup.needs_confirmation:
             # 版本不同，记录为冲突，不自动处理
             logger.debug(
-                "批量安装 - 版本冲突: {} 已有=v{} 待装=v{}",
-                manifest.name, dup.existing_version, manifest.version,
+                "批量安装 - 版本冲突: {} 已有={} 待装={}",
+                manifest.name, display_version(dup.existing_version),
+                display_version(manifest.version),
             )
             return BatchItemResult(
                 file_path=fp,
                 status=BatchItemStatus.CONFLICT,
                 message=(
-                    f"版本冲突：已有 v{dup.existing_version}，"
-                    f"待添加 v{manifest.version}"
+                    f"版本冲突：已有 {display_version(dup.existing_version)}，"
+                    f"待添加 {display_version(manifest.version)}"
                 ),
                 manifest=manifest,
                 duplicate_report=dup,
             )
 
-        # 3. 移除旧版本（正常情况不会到这里，但防御性处理）
-        if dup.existing_mod is not None:
-            config = get_config()
-            base_str = config.game_mod_path if location == ModLocation.GAME else config.repo_path
-            self._remove_mod_files(dup.existing_mod, base_str)
-            self.session.delete(dup.existing_mod)
-            self.session.flush()
-
-        # 4. 复制文件
-        author_dir = get_author_dir(base_path, manifest.author)
+        # 3. 复制文件（GAME 端按 F19 分类布局）
+        #    F04-8: 先复制成功、再删旧版本（正常情况不会有旧版本，防御性处理）
+        if location == ModLocation.GAME:
+            author_dir = self._game_target_dir(base_path, category, manifest.author)
+        else:
+            author_dir = get_author_dir(base_path, manifest.author)
         try:
             dest_file = safe_copy(
                 src=fp,
                 dst_dir=author_dir,
-                author=manifest.display_author,
                 file_name=fp.name,
                 version=manifest.version,
             )
@@ -1196,12 +2299,18 @@ class ModService:
                 manifest=manifest,
             )
 
+        # 4. 复制成功后移除旧版本（防御性）
+        if dup.existing_mod is not None:
+            self._remove_mod_files(dup.existing_mod, base_path)
+            self.session.delete(dup.existing_mod)
+            self.session.flush()
+
         # 5. 写入数据库
         mod = Mod(
             guid=manifest.guid,
             name=manifest.name,
             version=manifest.version,
-            author=manifest.author,
+            author=_normalize_author(manifest.author),
             author_normalized=manifest.author_normalized,
             description=manifest.description,
             website=manifest.website,
@@ -1213,6 +2322,10 @@ class ModService:
                 compute_repo_relative_path(base_path, dest_file)
                 if location == ModLocation.REPO else ""
             ),
+            game_relative_path=(
+                compute_relative_path(base_path, dest_file)
+                if location == ModLocation.GAME else ""
+            ),
         )
         self.session.add(mod)
 
@@ -1223,15 +2336,15 @@ class ModService:
             mod_name=manifest.name,
             mod_guid=manifest.guid,
             location=loc_label,
-            detail=f"批量添加 v{manifest.version} → {dest_file}",
+            detail=f"批量添加 {display_version(manifest.version)} → {dest_file}",
         )
         self.session.commit()
 
-        logger.debug("批量安装 - 成功: {} v{}", manifest.name, manifest.version)
+        logger.debug("批量安装 - 成功: {} {}", manifest.name, display_version(manifest.version))
         return BatchItemResult(
             file_path=fp,
             status=BatchItemStatus.SUCCESS,
-            message=f"成功：{manifest.name} v{manifest.version}",
+            message=f"成功：{manifest.name} {display_version(manifest.version)}",
             manifest=manifest,
         )
 
@@ -1241,15 +2354,12 @@ class ModService:
 
     @staticmethod
     def _remove_mod_files(mod: Mod, base_path: str) -> None:
-        """删除 Mod 对应的磁盘文件"""
+        """删除 Mod 对应的磁盘文件（rel path 优先定位，F19-6）"""
         base = Path(base_path)
-        if mod.location == ModLocation.REPO and mod.repo_relative_path:
-            # REPO 端优先用精确路径
-            file_path = base / mod.repo_relative_path
+        if mod.location == ModLocation.REPO:
+            file_path = resolve_repo_mod_path(mod, base)
         else:
-            # GAME 端 或 老数据回退
-            author_dir = get_author_dir(base, mod.author)
-            file_path = author_dir / mod.current_file_name
+            file_path = resolve_game_mod_path(mod, base)
         if file_path.exists():
             delete_file(file_path)
 

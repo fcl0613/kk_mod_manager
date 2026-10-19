@@ -18,7 +18,9 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
 from PyQt6.QtGui import QColor
 
+from app.config import describe_category
 from app.models.mod import ModLocation
+from app.utils.version_utils import display_version
 from app.services.mod_service import (
     ModService,
     BatchInstallResult,
@@ -42,17 +44,20 @@ class BatchInstallWorker(QObject):
         mod_service: ModService,
         file_list: list[Path],
         location: ModLocation,
+        category: str | None = None,
     ):
         super().__init__()
         self._service = mod_service
         self._file_list = file_list
         self._location = location
+        self._category = category  # F19 目标分类（仅 GAME 端使用）
 
     def run(self):
         result = self._service.batch_install(
             self._file_list,
             self._location,
             progress_callback=self._on_progress,
+            category=self._category,
         )
         self.finished.emit(result)
 
@@ -75,10 +80,12 @@ class BatchInstallDialog(QDialog):
         mod_service: ModService,
         location: ModLocation,
         parent=None,
+        category: str | None = None,
     ):
         super().__init__(parent)
         self._service = mod_service
         self._location = location
+        self._category = category  # F19 目标分类（仅 GAME 端使用）
         self._file_list: list[Path] = []
         self._result: BatchInstallResult | None = None
         self._worker: BatchInstallWorker | None = None
@@ -100,6 +107,8 @@ class BatchInstallDialog(QDialog):
 
         # ── 标题 ──
         loc_text = "游戏 Mod 目录" if self._location == ModLocation.GAME else "本地仓库"
+        if self._location == ModLocation.GAME and self._category:
+            loc_text += f"（分类：{describe_category(self._category)}/）"
         title = QLabel(f"📦 批量添加 Mod → {loc_text}")
         title.setObjectName("title")
         layout.addWidget(title)
@@ -333,6 +342,7 @@ class BatchInstallDialog(QDialog):
             self._service,
             list(self._file_list),
             self._location,
+            category=self._category,
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -403,15 +413,15 @@ class BatchInstallDialog(QDialog):
 
             if item.status == BatchItemStatus.SKIPPED:
                 dup = item.duplicate_report
-                tree_item.setText(2, dup.existing_version if dup else "—")
-                tree_item.setText(3, dup.incoming_version if dup else "—")
+                tree_item.setText(2, display_version(dup.existing_version) if dup else "—")
+                tree_item.setText(3, display_version(dup.incoming_version) if dup else "—")
                 tree_item.setText(4, "⏭ 已跳过")
                 tree_item.setForeground(4, QColor("#a6adc8"))
 
             elif item.status == BatchItemStatus.CONFLICT:
                 dup = item.duplicate_report
-                existing_v = dup.existing_version if dup else "—"
-                incoming_v = dup.incoming_version if dup else "—"
+                existing_v = display_version(dup.existing_version) if dup else "—"
+                incoming_v = display_version(dup.incoming_version) if dup else "—"
                 tree_item.setText(2, existing_v)
                 tree_item.setText(3, incoming_v)
 

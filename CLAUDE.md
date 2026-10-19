@@ -12,14 +12,26 @@ KK Mod Manager is a PyQt6 desktop GUI for managing Sideloader `.zipmod` files fo
 # Install dependencies
 pip install -r requirements.txt
 
+# Install dev/test dependencies (includes pytest)
+pip install -r requirements-dev.txt
+
 # Run the app (development)
 python main.py
+
+# Run the test suite
+.venv/Scripts/python.exe -m pytest
 
 # Package to .exe
 pyinstaller KKModManager.spec
 ```
 
-There is no test runner configured. The single test file (`tests/card_service_test.py`) has hardcoded local paths and is run manually: `python tests/card_service_test.py`.
+### Testing
+
+pytest is configured in `pyproject.toml` (`[tool.pytest.ini_options]`). `python_files = ["test_*.py"]` is load-bearing: the default pattern also matches the three legacy manual scripts (`tests/*_test.py`), which must stay out of pytest collection.
+
+- `tests/test_*.py` + `tests/conftest.py` — the real suite (services, utils, models, card parsing). Fixtures provide in-memory SQLite, tmp game/repo dirs, and an **autouse swap of `app.config._config_instance`** so no test ever touches real `data/` paths; zipmod/card fixtures are generated at runtime (`.gitignore` excludes `*.zipmod` and `data/`).
+- `tests/sync_service_test.py` — manual script covering `sync_from_disk` (14 scenarios, run directly with `python tests/sync_service_test.py`); intentionally not migrated to pytest. `sync_from_disk`/`refresh_from_disk` are covered there, not in the pytest suite.
+- `tests/card_service_test.py`, `tests/scene_service_test.py`, `tests/_scene_explore.py` — exploratory scratch scripts with hardcoded local paths and no assertions; they stay untracked and out of pytest collection. The real scene-card tests live in `tests/test_scene_service.py`.
 
 ## Architecture
 
@@ -31,14 +43,15 @@ There is no test runner configured. The single test file (`tests/card_service_te
 2. `MainWindow` calls `init_db()` (SQLAlchemy `create_all`), creates a `ModService` with a session from `get_session()`, and wires UI signals to service methods.
 3. All business operations go through `ModService` which takes a SQLAlchemy `Session` in its constructor — it handles parsing, duplicate detection, file copy/delete, DB writes, and operation logging in one transaction.
 4. `ManifestService` is stateless: `parse_from_zipmod(path)` reads `manifest.xml` from inside the zipmod, `check_duplicate()` queries DB for GUID+location conflicts with semantic version comparison via `packaging.version.Version`.
-5. `CardService` uses the third-party `kkloader` library to parse Koikatsu character cards and custom binary parsing for clothing cards. `check_mod_availability()` cross-references extracted GUIDs against the database.
+5. `CardService` uses the third-party `kkloader` library to parse Koikatsu character cards and custom binary parsing for clothing cards. Scene cards (detected by the 【KStudio】 marker after PNG IEND) are delegated to `SceneService.parse_scene()`, which merges scene-level Sideloader UAR dependencies (items/patterns/map/filter/ramp/BGM) with the deps of each embedded character. `check_mod_availability()` cross-references extracted GUIDs against the database.
 
 ### Key architectural rules
 
-- **`.zipmod` files are never unzipped.** Installing a mod = copying the `.zipmod` file into `{game_path}/{AuthorName}/`. Removing = deleting the file.
+- **`.zipmod` files are never unzipped.** Installing a mod = copying the `.zipmod` file into `{game_path}/{Category}/{AuthorName}/` (F19 category routing, on by default; falls back to `{game_path}/{AuthorName}/` when disabled). Removing = deleting the file. The repo side stays flat: `{repo_path}/{AuthorName}/`.
 - **Enable/disable is a rename operation**: `.zipmod` ↔ `.zipmod_disabled` (applies only to GAME-location mods).
 - **Same GUID can have two rows** in the `mods` table — one with `location=GAME`, one with `location=REPO`. The composite unique index is `(location, guid)`.
-- **Author directory matching is case-insensitive**: `get_author_dir()` searches existing directories case-insensitively before creating new ones.
+- **Author directory matching is case-insensitive**: `get_author_dir()` searches existing directories case-insensitively before creating new ones. Category dirs reuse the same matcher (F19); category names are reserved — never inferred as author names during disk sync.
+- **File location is relative-path-first** (F19): GAME rows persist `game_relative_path`, REPO rows `repo_relative_path`; both fall back to author-dir derivation when empty. The basename is always swapped for `current_file_name` so enable/disable renames resolve in both directions.
 - **Version comparison** uses `packaging.version.Version`; unparseable versions fall through to `UNKNOWN_VERSION` (conservative — asks user).
 
 ### SQLAlchemy sessions

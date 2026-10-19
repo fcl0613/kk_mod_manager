@@ -6,6 +6,7 @@
   - F15-3: 依次检查游戏路径、仓库路径
   - F15-4: 标记状态（已安装/仓库有/缺失）
   - F15-8: 解析失败友好提示
+  - F15-12 (v1.7): 版本差异角标——游戏已装时比对仓库同 GUID 版本
 
 Koikatsu 卡片格式:
   角色卡/服装卡为 PNG 文件，PNG 数据之后附加了一段数据块。
@@ -19,6 +20,7 @@ Koikatsu 卡片格式:
   4. 若 ZIP 解析失败，使用正则匹配 GUID 模式
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -27,6 +29,7 @@ import struct
 
 from sqlalchemy.orm import Session
 from loguru import logger
+from packaging.version import InvalidVersion, Version
 
 from app.models.mod import Mod, ModLocation
 from kkloader import KoikatuCharaData
@@ -38,6 +41,14 @@ SKIP_AFTER_IEND = 8  # 固定跳过8字节
 SKIP_AFTER_CHECK = 10  # 检测成功后再跳过10字节
 NAME_END_BYTES = b"\x28\x00\x00\xDF\x12\x00\x00"  # 卡片名结束标志
 STOP_TAG = b"<additionalAccessories"
+SCENE_KEY = "【KStudio】".encode("utf-8")  # 场景卡尾部标识（BR-C05）
+
+# 依赖来源标签 → 粗分类型（F17-13）。
+# 角色类来源：内嵌角色依赖的来源前缀（scene_service 拼接 "角色: 昵称"）；
+# 工作室类来源：场景级 UAR 依赖标签（与 scene_service.LIST_DEPS/STRING_DEPS 一致，
+# 由 tests/test_scene_service.py 一致性守护测试兜底）。
+CHARA_SOURCE_PREFIX = "角色: "
+STUDIO_SOURCE_TAGS = frozenset({"场景物品", "场景图案", "地图", "滤镜", "Ramp", "BGM"})
 
 
 class CardModStatus(Enum):
@@ -64,6 +75,16 @@ class CardModItem:
     mod_id: int | None = None  # 数据库记录 ID（用于一键安装）
     location: str = ""  # 位置："game" / "repo"
 
+    # ── 版本差异角标（F15-12 / Q-04）──
+    repo_version: str = ""  # 仓库中同 GUID 的更新版本（仅 INSTALLED 且仓库版本更新时填充）
+    repo_mod_id: int | None = None  # 对应仓库行 ID（「升级」按钮的安装来源，F15-13）
+
+    # ── 场景卡解析扩展（F17）──
+    sources: list[str] = field(default_factory=list)  # 依赖来源标签，如 "场景物品" / "角色: 雪"
+    meta_name: str = ""  # 卡内 UAR 元数据（缺失时的下载线索，F17-7）
+    meta_author: str = ""
+    meta_website: str = ""
+
     @property
     def status_icon(self) -> str:
         icons = {
@@ -82,11 +103,45 @@ class CardModItem:
         }
         return texts[self.status]
 
+    @property
+    def has_newer_in_repo(self) -> bool:
+        """仓库中有同 GUID 的更新版本（🟢 角标条件，F15-12）"""
+        return self.status is CardModStatus.INSTALLED and self.repo_mod_id is not None
+
+    @property
+    def dep_type(self) -> str:
+        """依赖粗分类型（F17-13）：角色 / 工作室 / 角色+工作室。
+
+        由来源标签推导：含 "角色: " 前缀来源 → 角色；含工作室标签 → 工作室；
+        两者皆有 → 角色+工作室。空来源（人物/服装卡）按卡片视角归"角色"
+        （F19-3：无场景上下文的角色类依赖统一落角色分类）。
+        """
+        has_chara = any(s.startswith(CHARA_SOURCE_PREFIX) for s in self.sources)
+        has_studio = any(s in STUDIO_SOURCE_TAGS for s in self.sources)
+        if has_chara and has_studio:
+            return "角色+工作室"
+        if has_studio:
+            return "工作室"
+        return "角色"
+
 
 class GameVersion(Enum):
     """游戏版本"""
     KK = "kk"  # 一代卡（Koikatu）
     KKS = "kks"  # 二代卡（Koikatsu Sunshine）
+
+
+@dataclass
+class SceneSummary:
+    """场景卡摘要信息（F17-2）"""
+    version: str = ""  # 场景数据版本，如 "1.0.4.2"
+    character_count: int = 0  # 内嵌角色数
+    item_count: int = 0  # 物品数
+    map_id: int = -1  # 地图 ID（kkloader 中 map 为 int；-1 表示无/未知）
+    has_timeline: bool = False  # 是否 Timeline 动画场景
+    game_version: GameVersion | None = None  # 取自首个成功解析的内嵌角色
+    character_names: list[str] = field(default_factory=list)  # 内嵌角色名单
+    skipped_characters: list[str] = field(default_factory=list)  # 解析失败被跳过的角色（BR-C08）
 
 
 @dataclass
@@ -99,6 +154,7 @@ class CardParseResult:
     error_message: str = ""  # 错误信息
     game_version: GameVersion | None = None  # 游戏版本（KK / KKS）
     mods: list[CardModItem] = field(default_factory=list)
+    scene_summary: SceneSummary | None = None  # 场景摘要（仅场景卡非空）
 
     @property
     def total_count(self) -> int:
@@ -173,19 +229,26 @@ class CardService:
         except Exception as e:
             return False, f"转换失败：{e}"
 
-    def parse_card(self, card_path: Path) -> CardParseResult:
+    def parse_card(
+        self,
+        card_path: Path,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> CardParseResult:
         """
-        解析角色卡/服装卡 PNG 文件，提取依赖的 Mod GUID 列表。
+        解析角色卡/服装卡/场景卡 PNG 文件，提取依赖的 Mod GUID 列表。
 
-        判断逻辑（BR-C02）：
+        判断逻辑（BR-C02 / BR-C05）：
           1. 读取 PNG，定位 IEND 末尾
-          2. 检查 IEND 后数据是否包含 KoiKatuClothes 标识
-             → 是 → 服装卡，调用 parse_cloth_card
-             → 否 → 角色卡，调用 parse_character_card
-          3. 对提取的 GUID 统一 strip 处理
+          2. IEND 后数据含 KoiKatuClothes 标识 → 服装卡（parse_cloth_card）
+          3. 含 【KStudio】 标识 → 场景卡，委托 SceneService.parse_scene
+             （顺序不可换：场景内嵌角色也含 【KoiKatuChara】 标识）
+          4. 其余 → 角色卡，调用 parse_character_card
+          5. 对提取的 GUID 统一 strip 处理（场景分支在 SceneService 内完成）
 
         Args:
             card_path: PNG 卡片文件路径
+            progress: 进度回调 (已处理内嵌角色数, 总角色数)，仅场景卡触发
+                （F17-11，供后台线程显示进度）；其余卡型忽略
 
         Returns:
             CardParseResult 包含 GUID 列表和解析状态
@@ -241,6 +304,14 @@ class CardService:
 
             # 判断卡片类型：KoiKatuClothes → 服装卡，否则 → 角色卡
             is_cloth = self._is_cloth_card(extra)
+
+            # 场景卡（BR-C05）：委托 SceneService，提前 return
+            # （kc 置 None，避免残留上一张角色卡的数据）
+            if self._is_scene_card(extra):
+                from app.services import scene_service  # 惰性导入避免循环依赖
+                self.kc = None
+                logger.debug("识别为场景卡: {}", path.name)
+                return scene_service.SceneService.parse_scene(path, progress=progress)
 
             guids: set[str] = set()
             if is_cloth:
@@ -304,7 +375,8 @@ class CardService:
         检查卡片依赖的每个 Mod 在游戏和仓库中的可用性。
 
         顺序（BR-C03）：
-          ① 先查游戏 Mod 路径
+          ① 先查游戏 Mod 路径——命中后再比对仓库同 GUID 版本，
+             仓库更新则标记版本差异角标（F15-12 / Q-04，BR-C04）
           ② 再查仓库路径
             ㉃ 都没有 → 标记为缺失
 
@@ -332,6 +404,24 @@ class CardService:
                 item.mod_id = game_mod.id
                 item.location = "game"
                 installed += 1
+
+                # 版本差异角标（F15-12）：仓库同 GUID 版本更新才标记；
+                # 版本无法解析时保守不标（BR-V03 口径，避免误导）
+                repo_dup: Mod | None = (
+                    db_session.query(Mod)
+                    .filter(
+                        Mod.guid == item.guid,
+                        Mod.location == ModLocation.REPO,
+                    )
+                    .first()
+                )
+                if repo_dup is not None:
+                    try:
+                        if Version(repo_dup.version) > Version(game_mod.version):
+                            item.repo_version = repo_dup.version
+                            item.repo_mod_id = repo_dup.id
+                    except InvalidVersion:
+                        pass
                 continue
 
             # ② 查仓库中的 Mod
@@ -371,6 +461,11 @@ class CardService:
         if len(extra) < SKIP_AFTER_IEND + len(CHECK_KEY):
             return False
         return extra[SKIP_AFTER_IEND:SKIP_AFTER_IEND + len(CHECK_KEY)] == CHECK_KEY
+
+    @staticmethod
+    def _is_scene_card(extra: bytes) -> bool:
+        """检测 IEND 后数据是否含【KStudio】场景标识（场景卡）"""
+        return SCENE_KEY in extra
 
     @staticmethod
     def _find_png_end(data: bytes) -> int | None:

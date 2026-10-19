@@ -19,6 +19,7 @@ from packaging.version import Version, InvalidVersion
 from sqlalchemy.orm import Session
 
 from app.models.mod import Mod, ModLocation
+from app.utils.version_utils import display_version
 
 
 # ── 数据类 ──
@@ -44,7 +45,10 @@ class ModManifest:
         return self.author.strip() if self.author else "Unknown"
 
     def __str__(self) -> str:
-        return f"{self.name} v{self.version} by {self.display_author} [{self.guid}]"
+        return (
+            f"{self.name} {display_version(self.version)} "
+            f"by {self.display_author} [{self.guid}]"
+        )
 
 
 # ── 重复检测枚举 ──

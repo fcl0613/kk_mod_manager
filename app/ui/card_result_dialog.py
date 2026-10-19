@@ -24,6 +24,7 @@ from app.services.card_service import (
     CardParseResult,
     CardModStatus,
 )
+from app.utils.version_utils import display_version
 
 
 class CardResultDialog(QDialog):
@@ -160,13 +161,14 @@ class CardResultDialog(QDialog):
                 f"🟢 已安装（{len(installed)} 个）", self.INSTALLED_COLOR
             )
             for item in installed:
-                self._add_item(
-                    group,
-                    "已安装",
-                    f"{item.mod_author}/{item.mod_name} v{item.mod_version}",
-                    item.guid,
-                    "",
-                )
+                info = f"{item.mod_author}/{item.mod_name} {display_version(item.mod_version)}"
+                if item.has_newer_in_repo:
+                    # 版本差异角标（F15-12）：⬆ 角标 + 信息列补仓库版本 + 升级按钮（F15-13）
+                    info += f" → 仓库 {display_version(item.repo_version)}"
+                    self._add_item(group, "已安装 ⬆", info, item.guid,
+                                   "升级", item.repo_mod_id)
+                else:
+                    self._add_item(group, "已安装", info, item.guid, "")
 
         # 🟡 仓库有
         if in_repo:
@@ -177,7 +179,7 @@ class CardResultDialog(QDialog):
                 self._add_item(
                     group,
                     "仓库有",
-                    f"{item.mod_author}/{item.mod_name} v{item.mod_version}",
+                    f"{item.mod_author}/{item.mod_name} {display_version(item.mod_version)}",
                     item.guid,
                     "安装",
                     item.mod_id,
@@ -240,16 +242,16 @@ class CardResultDialog(QDialog):
         item.setText(2, guid)
         item.setText(3, action)
 
-        if status == "已安装":
+        if status.startswith("已安装"):
             item.setForeground(1, Qt.GlobalColor.white)
         elif status == "仓库有":
             item.setForeground(1, Qt.GlobalColor.white)
         elif status == "缺失":
             item.setForeground(2, Qt.GlobalColor.white)
 
-        if action == "安装" and mod_id is not None:
+        if action in ("安装", "升级") and mod_id is not None:
             item.mod_id = mod_id
-            btn = QPushButton("安装")
+            btn = QPushButton(action)
             btn.setFixedSize(60, 24)
             btn.setStyleSheet(
                 "QPushButton { background-color: #a6e3a1; color: #1e1e2e; "

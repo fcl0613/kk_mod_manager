@@ -8,9 +8,11 @@
   - BR-F06: 冲突时追加序号
 """
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
 import os
+
+from app.utils.version_utils import display_version
 
 
 def ensure_dir(path: Path) -> Path:
@@ -22,7 +24,6 @@ def ensure_dir(path: Path) -> Path:
 def safe_copy(
     src: Path,
     dst_dir: Path,
-    author: str,
     file_name: str,
     version: str,
 ) -> Path:
@@ -53,19 +54,26 @@ def safe_copy(
 
     target = dst_dir / file_name
 
+    # 源文件已在目标位置（如对仓库目录内的文件执行「添加到仓库」）
+    # → 原地生效，避免自拷贝出带版本后缀的副本
+    if src.resolve() == target.resolve():
+        return target
+
     if not target.exists():
         shutil.copy2(src, target)
         return target
 
-    # 同名文件已存在 → 用版本号重命名
-    new_name = f"{stem}v{version}{suffix}"
+    # 同名文件已存在 → 用版本号重命名（display_version 保证前缀唯一，
+    # 版本号自带 v 前缀时不会出现 "vv" 文件名）
+    v = display_version(version)
+    new_name = f"{stem}{v}{suffix}"
     target = dst_dir / new_name
 
     # 仍冲突 → 追加序号
     if target.exists():
         counter = 1
         while True:
-            new_name = f"{stem}v{version}_{counter}{suffix}"
+            new_name = f"{stem}{v}_{counter}{suffix}"
             target = dst_dir / new_name
             if not target.exists():
                 break
@@ -121,20 +129,21 @@ def clean_empty_dirs(root: Path, exclude_names: set | None = None) -> int:
 
     Args:
         root: 根目录
-        exclude_names: 要排除的目录名集合
+        exclude_names: 要排除的目录名集合（大小写不敏感，BR-CAT06 分类目录保护）
 
     Returns:
         清理的目录数
     """
     if exclude_names is None:
         exclude_names = set()
+    exclude_lower = {str(name).lower() for name in exclude_names}
 
     cleaned = 0
     for dirpath, dirnames, filenames in os.walk(root, topdown=False):
         dirpath = Path(dirpath)
         if dirpath == root:
             continue
-        if dirpath.name in exclude_names:
+        if dirpath.name.lower() in exclude_lower:
             continue
         # 检查目录是否为空（且无子目录）
         remaining = [d for d in dirpath.iterdir()]
@@ -179,6 +188,19 @@ def get_author_dir(base_path: Path, author: str) -> Path:
     return base_path / display_name
 
 
+def compute_relative_path(root: Path, file_path: Path) -> str:
+    """计算文件相对根目录的相对路径（POSIX 风格，GAME/REPO 通用，F19-6）。
+
+    Args:
+        root: 根目录（游戏 Mods 根或仓库根）
+        file_path: Mod 文件的绝对路径
+
+    Returns:
+        相对于 root 的 POSIX 风格相对路径，如 "ForCharactersLoading/Makise/[Makise]GS-Alice.zipmod"
+    """
+    return Path(file_path).resolve().relative_to(Path(root).resolve()).as_posix()
+
+
 def compute_repo_relative_path(repo_root: Path, file_path: Path) -> str:
     """计算仓库 Mod 文件相对于仓库根的相对路径（POSIX 风格）。
 
@@ -189,7 +211,7 @@ def compute_repo_relative_path(repo_root: Path, file_path: Path) -> str:
     Returns:
         相对于 repo_root 的 POSIX 风格相对路径，如 "Makise/[Makise]GS-Alice.zipmod"
     """
-    return Path(file_path).resolve().relative_to(Path(repo_root).resolve()).as_posix()
+    return compute_relative_path(repo_root, file_path)
 
 
 def resolve_repo_mod_path(mod, repo_root: Path) -> Path:
@@ -210,3 +232,95 @@ def resolve_repo_mod_path(mod, repo_root: Path) -> Path:
     # 回退：兼容老数据（迁移前 + 找不到文件的孤儿记录）
     author_dir = get_author_dir(repo_root, mod.author)
     return author_dir / mod.current_file_name
+
+
+def resolve_game_mod_path(mod, game_root: Path) -> Path:
+    """解析游戏 Mod 的磁盘绝对路径（F19-6，与 resolve_repo_mod_path 对称）。
+
+    优先使用 mod.game_relative_path（basename 按当前启停状态替换为
+    mod.current_file_name，兼容 .zipmod ↔ .zipmod_disabled 双向改名）；
+    为空时（老数据）回退到"作者目录/文件名"旧公式。
+
+    Args:
+        mod: Mod 实例
+        game_root: 游戏 Mods 根目录
+
+    Returns:
+        Mod 文件的绝对路径
+    """
+    game_root = Path(game_root)
+    if mod.game_relative_path:
+        parent = PurePosixPath(mod.game_relative_path).parent
+        if str(parent) != ".":
+            return game_root / Path(*parent.parts) / mod.current_file_name
+        return game_root / mod.current_file_name
+    # 回退：兼容老数据（分类安装上线前的记录）
+    author_dir = get_author_dir(game_root, mod.author)
+    return author_dir / mod.current_file_name
+
+
+def infer_author_from_path(
+    file_path: Path,
+    base_path: Path,
+    category_names: list[str] | set[str],
+) -> str | None:
+    """从文件所在目录推断作者名（BR-CAT03 护栏，F19-7）。
+
+    取文件相对根的目录段自底向上找第一个不属于分类清单的段作为作者名；
+    全为分类段或文件直躺在根下 → None（归入 Unknown）。
+    分类目录名为保留名，不得被推断为作者（BR-CAT05）；
+    护栏不受分类开关控制（关闭开关后磁盘上的分类布局仍需正确扫描）。
+    比较大小写不敏感（与 get_author_dir 的目录匹配规则一致，BR-CAT01）。
+
+    Args:
+        file_path: zipmod 文件路径
+        base_path: Mods 根目录
+        category_names: 分类目录名清单
+
+    Returns:
+        推断出的作者目录名，或 None
+    """
+    try:
+        rel = Path(file_path).resolve().relative_to(Path(base_path).resolve())
+    except ValueError:
+        return None
+    category_lower = {str(c).strip().lower() for c in category_names if str(c).strip()}
+    for part in reversed(rel.parts[:-1]):  # 排除文件名，自底向上
+        if part.lower() not in category_lower:
+            return part
+    return None
+
+
+def derive_category_from_relpath(
+    rel_path: str,
+    category_names: list[str] | set[str],
+) -> str | None:
+    """从 GAME 端相对路径推导 F19 分类（F24 升级保位用）。
+
+    game_relative_path 形如 "ForCharactersLoading/Makise/[x].zipmod"：
+    首段命中分类清单（大小写不敏感，BR-CAT01 口径）→ 返回清单中的规范名
+    （保证 get_author_dir 能大小写不敏感找回原目录，目录被删后也能按规范名重建）；
+    首段不是分类（F19 前的平铺老布局 "Makise/x.zipmod"）或路径为空 → None
+    （升级回退 {作者}/ 平铺，与该行当前布局一致，不发生隐式搬家）。
+    分类总开关 game_category_enabled=False 时由 _game_target_dir 自行回退平铺，
+    本函数无需感知开关状态。
+
+    Args:
+        rel_path: Mod 行持久化的 game_relative_path（POSIX 风格，可为空）
+        category_names: 分类目录名清单
+
+    Returns:
+        分类规范名，或 None（无分类段）
+    """
+    rel = (rel_path or "").strip()
+    if not rel:
+        return None
+    parts = PurePosixPath(rel).parts
+    if len(parts) < 2:
+        return None  # 文件直躺根下 → 无分类段
+    first = parts[0]
+    for category in category_names:
+        name = str(category).strip()
+        if name and name.lower() == first.lower():
+            return name  # 返回清单中的规范名，非磁盘原样大小写
+    return None

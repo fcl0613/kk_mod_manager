@@ -61,9 +61,36 @@ def get_session_factory():
     return _SessionLocal
 
 
+def _run_schema_migration(engine) -> None:
+    """幂等补齐 mods 表的历史欠账列（F19-8）。
+
+    create_all 不会给已存在的表加列，存量库需用
+    PRAGMA table_info 检查后 ALTER TABLE ADD COLUMN：
+      - repo_relative_path: 历史欠账
+      - game_relative_path: F19 新增
+    """
+    from sqlalchemy import text
+
+    with engine.connect() as conn:
+        existing = {
+            row[1] for row in conn.execute(text("PRAGMA table_info(mods)"))
+        }
+        # 表不存在（首次运行由 create_all 建表）时无需迁移
+        if not existing:
+            return
+        for col in ("repo_relative_path", "game_relative_path"):
+            if col not in existing:
+                conn.execute(
+                    text(f"ALTER TABLE mods ADD COLUMN {col} VARCHAR(1000)")
+                )
+        conn.commit()
+
+
 def init_db():
-    """创建所有表（首次运行或模型变更时调用）"""
-    Base.metadata.create_all(get_engine())
+    """创建所有表（首次运行或模型变更时调用），并补齐存量库缺失列"""
+    engine = get_engine()
+    Base.metadata.create_all(engine)
+    _run_schema_migration(engine)
 
 
 def get_session() -> Session:

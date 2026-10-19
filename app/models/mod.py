@@ -13,6 +13,7 @@ from sqlalchemy import String, Enum, DateTime, Index
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+from app.utils.version_utils import display_version
 
 
 class ModLocation(PyEnum):
@@ -77,6 +78,9 @@ class Mod(Base):
     # —— 仓库mod相对路径 ——
     repo_relative_path: Mapped[str] = mapped_column(String(1000), default="", comment="仓库mod的相对路径")
 
+    # —— 游戏mod相对路径（F19，仅 GAME 记录使用，REPO 记录始终为 ""）——
+    game_relative_path: Mapped[str] = mapped_column(String(1000), default="", comment="游戏mod的相对路径")
+
     # ── 复合索引：同一位置下 GUID 唯一 ──
     __table_args__ = (
         Index("idx_location_guid", "location", "guid", unique=True),
@@ -85,7 +89,7 @@ class Mod(Base):
     def __repr__(self) -> str:
         return (
             f"<Mod(id={self.id}, guid='{self.guid}', name='{self.name}', "
-            f"v{self.version}, location={self.location.value}, "
+            f"{display_version(self.version)}, location={self.location.value}, "
             f"status={self.status.value})>"
         )
 
@@ -117,7 +121,8 @@ class Mod(Base):
             "status": self.status.value,
             "installed_at": self.installed_at.isoformat() if self.installed_at else None,
             "notes": self.notes,
-            "repo_relative_path": self.repo_relative_path
+            "repo_relative_path": self.repo_relative_path,
+            "game_relative_path": self.game_relative_path
         }
 
 
@@ -129,7 +134,7 @@ class OperationLog(Base):
 
     operation: Mapped[str] = mapped_column(
         String(50), nullable=False,
-        comment="操作类型：install / uninstall / repo_add / repo_remove / enable / disable / upgrade"
+        comment="操作类型：install / uninstall / repo_add / repo_remove / enable / disable / upgrade / sync / dedup"
     )
     mod_name: Mapped[str] = mapped_column(
         String(200), nullable=False, comment="Mod 名称"

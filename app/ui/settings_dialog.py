@@ -16,18 +16,15 @@ from pathlib import Path
 
 from PyQt6.QtCore import pyqtSignal, QUrl
 from PyQt6.QtGui import QDesktopServices
-from PyQt6.QtCore import QUrl
-from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton, QCheckBox, QComboBox,
-    QGroupBox, QFormLayout, QFileDialog, QLabel
     QGroupBox, QFormLayout, QFileDialog, QPlainTextEdit, QLabel, QWidget, QMessageBox
 )
 
 from app import __version__
-from app.config import get_config, save_config
 from app.services.update_service import RELEASES_PAGE_URL, is_newer_version
-
+from app.config import describe_category, get_config, save_config
+from app.logger import get_log_dir
 
 def _format_check_time(iso_str: str) -> str:
     """格式化 ISO 时间戳为友好显示"""
@@ -38,8 +35,7 @@ def _format_check_time(iso_str: str) -> str:
         return dt.strftime("%Y-%m-%d %H:%M:%S")
     except ValueError:
         return iso_str
-from app.config import describe_category, get_config, save_config
-from app.logger import get_log_dir
+
 
 
 class SettingsDialog(QDialog):

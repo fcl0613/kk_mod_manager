@@ -30,7 +30,7 @@ from app.models.mod import Mod, ModLocation, ModStatus, OperationLog
 from app.services.mod_service import ModService, InstallResult
 from app.services.card_service import CardService, CardParseResult
 from app.services.update_service import (
-    UpdateService, UpdateResult, UpdateStatus, RELEASES_PAGE_URL,
+    UpdateService, UpdateResult, UpdateStatus, RELEASES_PAGE_URL, is_newer_version,
 )
 from app.services.sideloader_log_service import (
     LogEntryKind,
@@ -290,13 +290,6 @@ class MainWindow(QMainWindow):
         self.log_btn.setCheckable(True)
         self.log_btn.clicked.connect(self._toggle_log_dialog)
         toolbar.addWidget(self.log_btn)
-
-        # 设置（图标式）
-        settings_btn = QToolButton()
-        settings_btn.setText("⚙")
-        settings_btn.setToolTip("设置")
-        settings_btn.clicked.connect(self._open_settings)
-        toolbar.addWidget(settings_btn)
 
         # 刷新（独立按钮，高频操作一步直达）
         refresh_btn = QToolButton()
@@ -1456,7 +1449,7 @@ class MainWindow(QMainWindow):
         if (
             cfg.update_notified_version
             and cfg.update_notified_version != self._update_service.current_version
-            and self._update_service.current_version > "0.0.0"
+            and is_newer_version(self._update_service.current_version, "0.0.0")
         ):
             logger.info(
                 "[update] 检测到版本变化：notified={} → current={}，重置 skipped_version",
@@ -1498,8 +1491,10 @@ class MainWindow(QMainWindow):
         )
         cfg = self._config
 
-        # 统一写入"最近检查时间"
-        cfg.update_last_check_at = datetime.now().isoformat()
+        # 写入"最近检查时间"：仅成功时计时（网络错误/限速/解析失败不写入），
+        # 否则一次故障会让节流跳过之后 interval_days 内的所有自动重试
+        if result.status.is_success:
+            cfg.update_last_check_at = datetime.now().isoformat()
 
         # 记录最新版本信息（供设置页展示 + "前往下载页面"按钮使用）
         if result.latest:

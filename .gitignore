@@ -5,7 +5,10 @@
 /logs
 /build
 /dist
+.codegraph/
 
 __pycache__
 
 data
+
+.mcp.json

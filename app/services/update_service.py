@@ -61,6 +61,19 @@ class UpdateStatus(Enum):
     RATE_LIMITED = "rate_limited"           # API 限速
     PARSE_ERROR = "parse_error"             # tag_name 等解析失败
 
+    @property
+    def is_success(self) -> bool:
+        """是否拿到 GitHub 的确定答案（有新版 / 已最新 / 仅预览版）。
+
+        用于节流计时：只有成功才写入上次检查时间，失败不计时，
+        避免一次网络故障把之后的自动重试全部挡在节流之外。
+        """
+        return self in (
+            UpdateStatus.UP_TO_DATE,
+            UpdateStatus.UPDATE_AVAILABLE,
+            UpdateStatus.PRERELEASE_AVAILABLE,
+        )
+
 
 @dataclass
 class UpdateResult:
